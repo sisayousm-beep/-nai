@@ -30,6 +30,25 @@ python -m http.server 5173
 4. **배치 실행** 페이지에서 캐릭터들 + 세트 선택 → 프리셋 설정 → `큐 생성` → `실행`
 5. 결과는 `출력폴더/{날짜_세션명}/{캐릭터명}/{슬롯제목_seed}.png` 형식으로 저장
 
+## 배치 공통 Prompt / Undesired Content
+
+배치 실행 페이지의 **배치 공통 Prompt / Undesired Content** 카드는 NovelAI 본가 UI의 "Prompt" + "Undesired Content" 입력란과 같은 동작을 한다.
+
+- **Prompt** (배치 공통): 작가 태그, 퀄리티/스타일 태그처럼 모든 작업에 공통으로 들어갈 문구. 캐릭터 basePrompt 와 슬롯 프롬프트 앞에 위치한다.
+- **Quality Tags Enabled** 토글: 켜면 모델별 NAI 기본 퀄리티 프리셋(`rating:general, best quality, very aesthetic, absurdres` 등)을 자동으로 맨 앞에 붙인다.
+- **Undesired Content** (배치 공통): 공통 네거티브 문구.
+- **UC Preset** 드롭다운: `없음 / Light / Heavy / Human Focus` 중 선택. NAI 본가의 UC Preset과 동일한 의미. 선택하면 해당 프리셋이 네거티브 맨 앞에 추가된다.
+- **최종 프롬프트 미리보기** 버튼으로 어떤 순서로 합성되는지 시각적으로 확인 가능.
+
+합성 순서:
+
+```
+Prompt   = [Quality preset?] + [Batch Prompt] + [Character.basePrompt] + [Slot.prompt]
+Negative = [UC preset?]      + [Batch Undesired] + [Slot.neg OR Character.neg]
+```
+
+배치 설정은 `localStorage`에 자동 저장되고, 세션 객체에도 함께 박제되어 실패 재시도 시 동일하게 적용된다.
+
 ## NAIS preset 가져오기 / 내보내기
 
 - **가져오기**: 프롬프트 세트 페이지 우상단 `JSON 가져오기 (NAIS)` 버튼으로 NAIS Image Studio의 preset JSON을 그대로 업로드. 각 scene의 `name`이 슬롯 제목(=파일명)으로, `scenePrompt`가 프롬프트로 들어가며, scene별 `width`/`height` 오버라이드도 그대로 보존된다.
