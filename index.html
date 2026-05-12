@@ -1,0 +1,1282 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>NAI Character Batch Runner</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <style>
+    html, body, #root { height: 100%; }
+    body { background: #0b0d12; color: #e7ebf3; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans KR", sans-serif; }
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-thumb { background: #2a3242; border-radius: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .card { background: #131826; border: 1px solid #20283a; border-radius: 14px; }
+    .input { background: #0f1422; border: 1px solid #20283a; border-radius: 10px; padding: 8px 10px; color: #e7ebf3; outline: none; }
+    .input:focus { border-color: #4f7cff; }
+    .btn { padding: 8px 14px; border-radius: 10px; border: 1px solid #20283a; background: #1a2236; color: #e7ebf3; transition: all .15s; }
+    .btn:hover:not(:disabled) { background: #232c44; }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-primary { background: #3b5cff; border-color: #3b5cff; }
+    .btn-primary:hover:not(:disabled) { background: #4f6dff; }
+    .btn-danger { background: #c2334a; border-color: #c2334a; }
+    .btn-danger:hover:not(:disabled) { background: #d8425a; }
+    .btn-ghost { background: transparent; border-color: transparent; }
+    .btn-ghost:hover:not(:disabled) { background: #1a2236; }
+    .badge { display: inline-flex; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .badge-pending { background: #2a3242; color: #b6c2d9; }
+    .badge-running { background: #2b3d8b; color: #c8d2ff; }
+    .badge-success { background: #1f6d3a; color: #b9f3cc; }
+    .badge-failed { background: #7a2030; color: #ffc4cf; }
+    .badge-skipped { background: #5a4a1f; color: #ffe6a8; }
+    .badge-cancelled { background: #3a3a3a; color: #cfcfcf; }
+    .row-hover:hover { background: #161c2c; }
+    .nav-item { padding: 10px 14px; border-radius: 10px; color: #b6c2d9; cursor: pointer; display: flex; align-items: center; gap: 10px; }
+    .nav-item:hover { background: #1a2236; color: #fff; }
+    .nav-item.active { background: #1c2944; color: #fff; border: 1px solid #2b3d6b; }
+    textarea.input { resize: vertical; min-height: 80px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="env,react">
+/* ──────────────────────────────────────────────────────────────────────────
+   NAI Character Batch Runner — single file MVP
+   설계 문서: NAI_Character_Batch_Runner_설계도_보고서.pdf
+   ────────────────────────────────────────────────────────────────────────── */
+
+const { useState, useEffect, useMemo, useCallback, useRef, useSyncExternalStore } = React;
+
+/* ============ Utils ============ */
+const uid = (p='id') => `${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+const nowIso = () => new Date().toISOString();
+const pad = (n, l=3) => String(n).padStart(l, '0');
+const sanitizeFs = (s) => (s||'').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, '_').slice(0, 80) || 'unnamed';
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const fmtDate = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return iso; } };
+const clone = (v) => JSON.parse(JSON.stringify(v));
+const randSeed = () => Math.floor(Math.random() * 2**32);
+
+/* ============ IndexedDB ============ */
+const DB_NAME = 'nai-batch-runner';
+const DB_VERSION = 1;
+const STORES = ['characters', 'promptSets', 'sessions', 'jobs', 'kv'];
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      STORES.forEach(name => {
+        if (!db.objectStoreNames.contains(name)) {
+          const s = db.createObjectStore(name, { keyPath: name === 'kv' ? 'key' : 'id' });
+          if (name === 'jobs') s.createIndex('sessionId', 'sessionId', { unique: false });
+        }
+      });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idb(store, mode, fn) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    const s = tx.objectStore(store);
+    const result = fn(s);
+    tx.oncomplete = () => resolve(result instanceof IDBRequest ? result.result : result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+const db = {
+  getAll: (store) => idb(store, 'readonly', s => {
+    return new Promise((res, rej) => {
+      const r = s.getAll();
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }).then(r => r),
+  get: (store, key) => idb(store, 'readonly', s => {
+    return new Promise((res, rej) => {
+      const r = s.get(key);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }).then(r => r),
+  put: (store, value) => idb(store, 'readwrite', s => s.put(value)),
+  delete: (store, key) => idb(store, 'readwrite', s => s.delete(key)),
+  clear: (store) => idb(store, 'readwrite', s => s.clear()),
+  bulkPut: (store, values) => idb(store, 'readwrite', s => { values.forEach(v => s.put(v)); }),
+  jobsBySession: (sessionId) => idb('jobs', 'readonly', s => {
+    return new Promise((res, rej) => {
+      const r = s.index('sessionId').getAll(IDBKeyRange.only(sessionId));
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }).then(r => r),
+};
+
+/* ============ KV (settings, dir handle) ============ */
+async function kvGet(key, defaultValue) {
+  const v = await db.get('kv', key);
+  return v ? v.value : defaultValue;
+}
+async function kvSet(key, value) {
+  await db.put('kv', { key, value });
+}
+
+/* ============ Settings (localStorage for non-secret prefs; token also in localStorage with mask) ============ */
+const DEFAULT_SETTINGS = {
+  apiToken: '',
+  delayBetweenJobsMs: 1500,
+  maxRetry: 2,
+  apiBase: 'https://image.novelai.net',
+};
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem('nai-settings');
+    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_SETTINGS };
+  } catch { return { ...DEFAULT_SETTINGS }; }
+}
+function saveSettings(s) {
+  localStorage.setItem('nai-settings', JSON.stringify(s));
+}
+function maskToken(t) {
+  if (!t) return '';
+  if (t.length <= 10) return '••••';
+  return `${t.slice(0,4)}••••••••${t.slice(-4)}`;
+}
+
+/* ============ Models / Defaults ============ */
+const MODELS = [
+  { id: 'nai-diffusion-4-5-full', label: 'NAI Diffusion v4.5 Full' },
+  { id: 'nai-diffusion-4-full', label: 'NAI Diffusion v4 Full' },
+  { id: 'nai-diffusion-4-curated-preview', label: 'NAI Diffusion v4 Curated' },
+  { id: 'nai-diffusion-3', label: 'NAI Diffusion v3' },
+];
+const SAMPLERS = ['k_euler', 'k_euler_ancestral', 'k_dpmpp_2s_ancestral', 'k_dpmpp_2m', 'k_dpmpp_sde', 'ddim'];
+const RESOLUTIONS = [
+  { label: 'Portrait 832×1216', w: 832, h: 1216 },
+  { label: 'Landscape 1216×832', w: 1216, h: 832 },
+  { label: 'Square 1024×1024', w: 1024, h: 1024 },
+  { label: 'Tall 1024×1536', w: 1024, h: 1536 },
+  { label: 'Wide 1536×1024', w: 1536, h: 1024 },
+];
+const DEFAULT_NEG = 'lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark';
+
+const DEFAULT_PRESET = {
+  model: 'nai-diffusion-4-5-full',
+  width: 832,
+  height: 1216,
+  steps: 28,
+  cfgScale: 5.0,
+  sampler: 'k_euler',
+  smea: false,
+  smeaDyn: false,
+};
+
+/* ============ Tiny event bus / store ============ */
+function createStore(initial) {
+  let state = initial;
+  const listeners = new Set();
+  return {
+    get: () => state,
+    set: (patch) => { state = typeof patch === 'function' ? patch(state) : { ...state, ...patch }; listeners.forEach(l => l()); },
+    subscribe: (l) => { listeners.add(l); return () => listeners.delete(l); },
+  };
+}
+function useStore(store) {
+  return useSyncExternalStore(store.subscribe, store.get, store.get);
+}
+
+/* Runner store: live queue control + progress */
+const runner = createStore({
+  isRunning: false,
+  isPaused: false,
+  isCancelling: false,
+  sessionId: null,
+  current: null, // { jobId, characterName, promptTitle, index, total }
+  logs: [],      // { ts, level, msg }
+});
+function rlog(level, msg) {
+  runner.set(s => ({ ...s, logs: [...s.logs.slice(-499), { ts: nowIso(), level, msg }] }));
+  // eslint-disable-next-line no-console
+  if (level === 'error') console.error('[runner]', msg);
+}
+
+/* ============ Prompt composition ============ */
+function composePrompt(character, slot) {
+  const parts = [];
+  if (character.basePrompt?.trim()) parts.push(character.basePrompt.trim());
+  if (slot.prompt?.trim()) parts.push(slot.prompt.trim());
+  return parts.join(', ');
+}
+function composeNegativePrompt(character, slot) {
+  const parts = [];
+  if (slot.negativePrompt?.trim()) parts.push(slot.negativePrompt.trim());
+  else if (character.negativePrompt?.trim()) parts.push(character.negativePrompt.trim());
+  if (!parts.length) parts.push(DEFAULT_NEG);
+  return parts.join(', ');
+}
+
+/* ============ Seed policy ============ */
+function resolveSeed(character, jobIndexInCharacter, perCharSeedCache) {
+  const mode = character.defaultSeedMode || 'random';
+  if (mode === 'fixed_per_job') return character.fixedSeed ?? randSeed();
+  if (mode === 'fixed_per_character') {
+    if (perCharSeedCache.has(character.id)) return perCharSeedCache.get(character.id);
+    const seed = character.fixedSeed ?? randSeed();
+    perCharSeedCache.set(character.id, seed);
+    return seed;
+  }
+  return randSeed();
+}
+
+/* ============ Queue build ============ */
+function buildQueue({ characters, promptSet, sessionId }) {
+  const jobs = [];
+  let order = 1;
+  for (const character of characters) {
+    for (const slot of promptSet.prompts) {
+      if (!slot.enabled) continue;
+      jobs.push({
+        id: uid('job'),
+        sessionId,
+        characterId: character.id,
+        characterName: character.name,
+        promptSlotId: slot.id,
+        promptTitle: slot.title,
+        order,
+        finalPrompt: composePrompt(character, slot),
+        finalNegativePrompt: composeNegativePrompt(character, slot),
+        status: 'pending',
+        retryCount: 0,
+        createdAt: nowIso(),
+      });
+      order += 1;
+    }
+  }
+  return jobs;
+}
+
+/* ============ NovelAI API ============ */
+function buildPayload({ job, preset, seed }) {
+  return {
+    input: job.finalPrompt,
+    model: preset.model,
+    action: 'generate',
+    parameters: {
+      params_version: 3,
+      width: preset.width,
+      height: preset.height,
+      scale: preset.cfgScale,
+      sampler: preset.sampler,
+      steps: preset.steps,
+      n_samples: 1,
+      ucPreset: 0,
+      qualityToggle: true,
+      sm: !!preset.smea,
+      sm_dyn: !!preset.smeaDyn,
+      dynamic_thresholding: false,
+      controlnet_strength: 1,
+      legacy: false,
+      add_original_image: false,
+      uncond_scale: 1,
+      cfg_rescale: 0,
+      noise_schedule: 'karras',
+      negative_prompt: job.finalNegativePrompt,
+      seed,
+    },
+  };
+}
+
+async function novelaiValidateToken(apiBase, token) {
+  // GET /user/information
+  const url = `${apiBase.replace(/\/$/,'')}/user/information`.replace('image.novelai.net','api.novelai.net');
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  return res.ok;
+}
+
+async function novelaiGenerate(apiBase, token, payload, signal) {
+  const url = `${apiBase.replace(/\/$/,'')}/ai/generate-image`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  if (!res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch {}
+    const err = new Error(`NovelAI ${res.status}: ${body.slice(0,300)}`);
+    err.status = res.status;
+    err.body = body;
+    throw err;
+  }
+  const buf = await res.arrayBuffer();
+  const zip = await JSZip.loadAsync(buf);
+  const pngEntry = Object.values(zip.files).find(f => /\.png$/i.test(f.name));
+  if (!pngEntry) throw new Error('응답 ZIP에 PNG 파일이 없습니다.');
+  const blob = await pngEntry.async('blob');
+  return new Blob([blob], { type: 'image/png' });
+}
+
+/* ============ File System Access Saver ============ */
+async function pickOutputDir() {
+  if (!window.showDirectoryPicker) throw new Error('이 브라우저는 폴더 저장 API를 지원하지 않습니다. Chrome 또는 Edge 최신 버전을 사용하세요.');
+  const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+  await kvSet('outputDirHandle', handle);
+  return handle;
+}
+async function getStoredOutputDir() {
+  const handle = await kvGet('outputDirHandle', null);
+  if (!handle) return null;
+  try {
+    const perm = await handle.queryPermission({ mode: 'readwrite' });
+    if (perm === 'granted') return handle;
+    const req = await handle.requestPermission({ mode: 'readwrite' });
+    return req === 'granted' ? handle : null;
+  } catch { return null; }
+}
+async function ensureDir(parent, name) {
+  return parent.getDirectoryHandle(sanitizeFs(name), { create: true });
+}
+async function writeFile(dir, name, data) {
+  const fh = await dir.getFileHandle(name, { create: true });
+  const w = await fh.createWritable();
+  await w.write(data);
+  await w.close();
+}
+async function findUnusedFilename(dir, baseName) {
+  let candidate = baseName;
+  let i = 2;
+  // try existence by attempting open; FileSystemDirectoryHandle has no list helper here
+  while (true) {
+    try {
+      await dir.getFileHandle(candidate, { create: false });
+      const dot = baseName.lastIndexOf('.');
+      const stem = dot > 0 ? baseName.slice(0, dot) : baseName;
+      const ext = dot > 0 ? baseName.slice(dot) : '';
+      candidate = `${stem}_v${i}${ext}`;
+      i += 1;
+    } catch {
+      return candidate;
+    }
+  }
+}
+
+async function saveJobResult({ rootDir, session, job, preset, seed, imageBlob }) {
+  const sessionDirName = `${session.startedAt.replace(/[:T]/g,'-').replace(/\..+$/,'')}_${sanitizeFs(session.name)}`;
+  const sessionDir = await ensureDir(rootDir, sessionDirName);
+  const charDir = await ensureDir(sessionDir, job.characterName);
+  const baseName = `${pad(job.order)}_${sanitizeFs(job.promptTitle)}_${seed}`;
+  const pngName = await findUnusedFilename(charDir, `${baseName}.png`);
+  const jsonName = pngName.replace(/\.png$/i, '.json');
+  await writeFile(charDir, pngName, imageBlob);
+  const meta = {
+    sessionId: session.id,
+    jobId: job.id,
+    characterName: job.characterName,
+    promptTitle: job.promptTitle,
+    finalPrompt: job.finalPrompt,
+    finalNegativePrompt: job.finalNegativePrompt,
+    model: preset.model,
+    width: preset.width,
+    height: preset.height,
+    steps: preset.steps,
+    cfgScale: preset.cfgScale,
+    sampler: preset.sampler,
+    smea: preset.smea,
+    smeaDyn: preset.smeaDyn,
+    seed,
+    createdAt: nowIso(),
+  };
+  await writeFile(charDir, jsonName, new Blob([JSON.stringify(meta, null, 2)], { type: 'application/json' }));
+  return { pngName, jsonName, sessionDirName };
+}
+
+async function saveSessionManifest(rootDir, session, jobs) {
+  const sessionDirName = `${session.startedAt.replace(/[:T]/g,'-').replace(/\..+$/,'')}_${sanitizeFs(session.name)}`;
+  const sessionDir = await ensureDir(rootDir, sessionDirName);
+  const manifest = {
+    id: session.id,
+    name: session.name,
+    startedAt: session.startedAt,
+    completedAt: session.completedAt || null,
+    preset: session.preset,
+    characterIds: session.characterIds,
+    promptSetId: session.promptSetId,
+    total: jobs.length,
+    success: jobs.filter(j => j.status==='success').length,
+    failed: jobs.filter(j => j.status==='failed').length,
+    skipped: jobs.filter(j => j.status==='skipped').length,
+    cancelled: jobs.filter(j => j.status==='cancelled').length,
+  };
+  await writeFile(sessionDir, 'session.json', new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }));
+}
+
+/* ============ Runner ============ */
+async function startRun({ session, jobs, preset, settings, rootDir }) {
+  runner.set({ isRunning: true, isPaused: false, isCancelling: false, sessionId: session.id, current: null, logs: [] });
+  rlog('info', `세션 시작: ${session.name} (jobs=${jobs.length})`);
+
+  const perCharSeed = new Map();
+  // restore per-character seeds from already-running session if reload
+  const characters = await db.getAll('characters');
+  const charById = new Map(characters.map(c => [c.id, c]));
+
+  // mark all jobs queued
+  for (let i = 0; i < jobs.length; i++) {
+    if (runner.get().isCancelling) break;
+    while (runner.get().isPaused) {
+      await sleep(400);
+      if (runner.get().isCancelling) break;
+    }
+    if (runner.get().isCancelling) break;
+
+    let job = jobs[i];
+    if (job.status === 'success' || job.status === 'skipped') continue;
+    const character = charById.get(job.characterId);
+    if (!character) {
+      job = { ...job, status: 'failed', errorMessage: '캐릭터를 찾을 수 없음', completedAt: nowIso() };
+      jobs[i] = job;
+      await db.put('jobs', job);
+      rlog('error', `#${job.order} 캐릭터 누락 → failed`);
+      continue;
+    }
+
+    const seed = job.seed ?? resolveSeed(character, i, perCharSeed);
+    runner.set(s => ({ ...s, current: { jobId: job.id, characterName: job.characterName, promptTitle: job.promptTitle, index: i+1, total: jobs.length } }));
+
+    job = { ...job, status: 'running', startedAt: nowIso(), seed };
+    jobs[i] = job;
+    await db.put('jobs', job);
+    rlog('info', `#${pad(job.order)} ${job.characterName} / ${job.promptTitle} 시작 (seed=${seed})`);
+
+    try {
+      const payload = buildPayload({ job, preset, seed });
+      const blob = await novelaiGenerate(settings.apiBase, settings.apiToken, payload);
+      const saved = await saveJobResult({ rootDir, session, job, preset, seed, imageBlob: blob });
+      job = { ...job, status: 'success', completedAt: nowIso(), outputPath: `${saved.sessionDirName}/${sanitizeFs(job.characterName)}/${saved.pngName}`, metadataPath: saved.jsonName, errorMessage: undefined };
+      jobs[i] = job;
+      await db.put('jobs', job);
+      rlog('info', `#${pad(job.order)} success → ${saved.pngName}`);
+    } catch (err) {
+      const isAuth = err.status === 401 || err.status === 403;
+      if (isAuth) {
+        job = { ...job, status: 'failed', completedAt: nowIso(), errorMessage: `인증 실패(${err.status}) — 토큰을 확인하세요.` };
+        jobs[i] = job;
+        await db.put('jobs', job);
+        rlog('error', `#${pad(job.order)} 인증 실패: 즉시 중단`);
+        runner.set(s => ({ ...s, isCancelling: true }));
+        break;
+      }
+      if (job.retryCount < settings.maxRetry) {
+        job = { ...job, status: 'pending', retryCount: job.retryCount + 1, errorMessage: String(err.message||err) };
+        jobs[i] = job;
+        await db.put('jobs', job);
+        rlog('warn', `#${pad(job.order)} 오류, 재시도 예정 (${job.retryCount}/${settings.maxRetry}): ${err.message||err}`);
+        i -= 1; // retry same index
+        await sleep(Math.max(1000, settings.delayBetweenJobsMs * 2));
+        continue;
+      } else {
+        job = { ...job, status: 'failed', completedAt: nowIso(), errorMessage: String(err.message||err) };
+        jobs[i] = job;
+        await db.put('jobs', job);
+        rlog('error', `#${pad(job.order)} 실패: ${err.message||err}`);
+      }
+    }
+    await sleep(settings.delayBetweenJobsMs);
+  }
+
+  // Mark remaining pending as cancelled if cancelling
+  if (runner.get().isCancelling) {
+    for (let i = 0; i < jobs.length; i++) {
+      if (jobs[i].status === 'pending' || jobs[i].status === 'running') {
+        const j = { ...jobs[i], status: 'cancelled', completedAt: nowIso() };
+        jobs[i] = j;
+        await db.put('jobs', j);
+      }
+    }
+    rlog('warn', '세션 중단됨 — 남은 작업 cancelled 처리');
+  }
+
+  session.completedAt = nowIso();
+  await db.put('sessions', session);
+  try { await saveSessionManifest(rootDir, session, jobs); } catch (e) { rlog('warn', `세션 매니페스트 저장 실패: ${e.message||e}`); }
+
+  runner.set({ isRunning: false, isPaused: false, isCancelling: false, sessionId: session.id, current: null, logs: runner.get().logs });
+  rlog('info', `세션 종료: ${session.name}`);
+}
+
+/* ============ UI Components ============ */
+function Badge({ status }) {
+  const map = {
+    pending: 'badge badge-pending', running: 'badge badge-running', success: 'badge badge-success',
+    failed: 'badge badge-failed', skipped: 'badge badge-skipped', cancelled: 'badge badge-cancelled',
+  };
+  return <span className={map[status]||'badge badge-pending'}>{status}</span>;
+}
+
+function ConfirmButton({ children, onConfirm, className='btn btn-danger', confirmText='정말?' }) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => { if (!armed) return; const t = setTimeout(() => setArmed(false), 2500); return () => clearTimeout(t); }, [armed]);
+  return (
+    <button className={className} onClick={() => { if (armed) { onConfirm(); setArmed(false); } else setArmed(true); }}>
+      {armed ? confirmText : children}
+    </button>
+  );
+}
+
+function Field({ label, children, hint }) {
+  return (
+    <label className="flex flex-col gap-1 text-sm">
+      <span className="text-slate-300">{label}</span>
+      {children}
+      {hint && <span className="text-xs text-slate-500">{hint}</span>}
+    </label>
+  );
+}
+
+/* ============ Pages ============ */
+function SettingsPage({ settings, setSettings }) {
+  const [token, setToken] = useState(settings.apiToken);
+  const [reveal, setReveal] = useState(false);
+  const [validating, setValidating] = useState(false);
+  const [validMsg, setValidMsg] = useState('');
+  const [dirName, setDirName] = useState('(미선택)');
+  const [delay, setDelay] = useState(settings.delayBetweenJobsMs);
+  const [maxRetry, setMaxRetry] = useState(settings.maxRetry);
+  const [apiBase, setApiBase] = useState(settings.apiBase);
+
+  useEffect(() => {
+    (async () => {
+      const h = await kvGet('outputDirHandle', null);
+      if (h?.name) setDirName(h.name);
+    })();
+  }, []);
+
+  const pick = async () => {
+    try {
+      const h = await pickOutputDir();
+      setDirName(h.name);
+    } catch (e) { alert(e.message || e); }
+  };
+
+  const validate = async () => {
+    setValidating(true); setValidMsg('');
+    try {
+      const ok = await novelaiValidateToken(apiBase, token);
+      setValidMsg(ok ? '✓ 토큰 유효' : '✗ 검증 실패');
+    } catch (e) {
+      setValidMsg(`✗ ${String(e.message||e).slice(0,120)}`);
+    } finally { setValidating(false); }
+  };
+
+  const save = () => {
+    const next = { ...settings, apiToken: token, delayBetweenJobsMs: Number(delay)||1500, maxRetry: Number(maxRetry)||0, apiBase };
+    saveSettings(next);
+    setSettings(next);
+    setValidMsg('✓ 저장됨');
+  };
+
+  return (
+    <div className="space-y-6 max-w-3xl">
+      <h2 className="text-xl font-semibold">설정</h2>
+      <div className="card p-5 space-y-4">
+        <Field label="NovelAI API 토큰" hint="로그·내보내기에는 포함되지 않습니다. 마스킹된 상태로 표시합니다.">
+          <div className="flex gap-2">
+            <input className="input flex-1 mono" type={reveal ? 'text' : 'password'} value={token} onChange={e=>setToken(e.target.value)} placeholder="pst-..." />
+            <button className="btn" onClick={()=>setReveal(r=>!r)}>{reveal?'숨김':'표시'}</button>
+            <button className="btn" onClick={validate} disabled={!token || validating}>{validating?'검증 중…':'검증'}</button>
+          </div>
+          <div className="text-xs text-slate-400 mono">현재 저장됨: {maskToken(settings.apiToken) || '(없음)'} {validMsg && <span className="ml-2">{validMsg}</span>}</div>
+        </Field>
+        <Field label="API Base URL" hint="기본: https://image.novelai.net (생성 엔드포인트)">
+          <input className="input mono" value={apiBase} onChange={e=>setApiBase(e.target.value)} />
+        </Field>
+        <Field label="출력 폴더" hint="이미지와 metadata.json 이 이 폴더 아래에 세션별로 저장됩니다.">
+          <div className="flex items-center gap-2">
+            <span className="input flex-1 mono">{dirName}</span>
+            <button className="btn" onClick={pick}>폴더 선택</button>
+          </div>
+        </Field>
+        <div className="grid grid-cols-2 gap-4">
+          <Field label="작업 사이 딜레이 (ms)"><input className="input" type="number" value={delay} onChange={e=>setDelay(e.target.value)} /></Field>
+          <Field label="최대 재시도 횟수"><input className="input" type="number" value={maxRetry} onChange={e=>setMaxRetry(e.target.value)} /></Field>
+        </div>
+        <div className="flex gap-2">
+          <button className="btn btn-primary" onClick={save}>저장</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CharactersPage({ characters, reload }) {
+  const [editing, setEditing] = useState(null); // character or 'new'
+  const isNew = editing === 'new';
+
+  const create = () => setEditing('new');
+  const edit = (c) => setEditing(clone(c));
+  const dup = async (c) => {
+    const copy = { ...clone(c), id: uid('char'), name: c.name + ' (복제)', createdAt: nowIso(), updatedAt: nowIso() };
+    await db.put('characters', copy);
+    reload();
+  };
+  const del = async (c) => { await db.delete('characters', c.id); reload(); };
+
+  const save = async (draft) => {
+    const now = nowIso();
+    const next = isNew
+      ? { id: uid('char'), createdAt: now, updatedAt: now, ...draft }
+      : { ...draft, updatedAt: now };
+    if (!next.outputFolderName) next.outputFolderName = next.name;
+    await db.put('characters', next);
+    setEditing(null);
+    reload();
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-semibold">캐릭터</h2>
+        <button className="btn btn-primary" onClick={create}>+ 새 캐릭터</button>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        {characters.map(c => (
+          <div key={c.id} className="card p-4 space-y-2">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="font-semibold">{c.name}</div>
+                <div className="text-xs text-slate-400">seed: {c.defaultSeedMode}{c.fixedSeed!=null?` · ${c.fixedSeed}`:''}</div>
+              </div>
+              <div className="flex gap-1">
+                <button className="btn btn-ghost" onClick={()=>edit(c)}>편집</button>
+                <button className="btn btn-ghost" onClick={()=>dup(c)}>복제</button>
+                <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={()=>del(c)}>삭제</ConfirmButton>
+              </div>
+            </div>
+            <div className="text-sm text-slate-300 line-clamp-3 mono">{c.basePrompt || <span className="text-slate-500">basePrompt 없음</span>}</div>
+            {c.negativePrompt && <div className="text-xs text-slate-500 line-clamp-2 mono">neg: {c.negativePrompt}</div>}
+          </div>
+        ))}
+        {characters.length === 0 && <div className="text-slate-500 col-span-full">아직 캐릭터가 없습니다. 새 캐릭터를 추가하세요.</div>}
+      </div>
+      {editing && <CharacterEditor key={isNew?'new':editing.id} initial={isNew?null:editing} onCancel={()=>setEditing(null)} onSave={save} />}
+    </div>
+  );
+}
+
+function CharacterEditor({ initial, onCancel, onSave }) {
+  const [draft, setDraft] = useState(initial || {
+    name: '', basePrompt: '', negativePrompt: '', defaultSeedMode: 'random', fixedSeed: '', outputFolderName: '', tags: []
+  });
+  const upd = (patch) => setDraft(d => ({ ...d, ...patch }));
+  const valid = draft.name.trim().length > 0;
+  const submit = () => {
+    if (!valid) return;
+    const out = { ...draft };
+    out.fixedSeed = out.fixedSeed === '' || out.fixedSeed == null ? undefined : Number(out.fixedSeed);
+    out.outputFolderName = (out.outputFolderName || out.name).trim();
+    onSave(out);
+  };
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onCancel}>
+      <div className="card p-5 w-full max-w-2xl space-y-3 max-h-[90vh] overflow-auto" onClick={e=>e.stopPropagation()}>
+        <h3 className="text-lg font-semibold">{initial ? '캐릭터 편집' : '새 캐릭터'}</h3>
+        <Field label="이름"><input className="input" value={draft.name} onChange={e=>upd({name:e.target.value})} /></Field>
+        <Field label="저장 폴더명 (선택)"><input className="input mono" value={draft.outputFolderName} onChange={e=>upd({outputFolderName:e.target.value})} placeholder="비우면 이름을 사용" /></Field>
+        <Field label="기본 프롬프트"><textarea className="input mono" value={draft.basePrompt} onChange={e=>upd({basePrompt:e.target.value})} /></Field>
+        <Field label="네거티브 프롬프트 (선택)"><textarea className="input mono" value={draft.negativePrompt} onChange={e=>upd({negativePrompt:e.target.value})} /></Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Seed 모드">
+            <select className="input" value={draft.defaultSeedMode} onChange={e=>upd({defaultSeedMode:e.target.value})}>
+              <option value="random">random (작업마다 랜덤)</option>
+              <option value="fixed_per_character">fixed_per_character (캐릭터당 고정)</option>
+              <option value="fixed_per_job">fixed_per_job (모든 작업 동일)</option>
+            </select>
+          </Field>
+          <Field label="고정 seed (선택)"><input className="input mono" value={draft.fixedSeed??''} onChange={e=>upd({fixedSeed:e.target.value})} placeholder="비우면 자동" /></Field>
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <button className="btn" onClick={onCancel}>취소</button>
+          <button className="btn btn-primary" onClick={submit} disabled={!valid}>저장</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PromptSetsPage({ promptSets, reload }) {
+  const [editing, setEditing] = useState(null);
+  const isNew = editing === 'new';
+  const create = () => setEditing('new');
+  const edit = (p) => setEditing(clone(p));
+  const dup = async (p) => {
+    const copy = { ...clone(p), id: uid('pset'), name: p.name + ' (복제)', createdAt: nowIso(), updatedAt: nowIso() };
+    copy.prompts = copy.prompts.map(s => ({ ...s, id: uid('slot') }));
+    await db.put('promptSets', copy);
+    reload();
+  };
+  const del = async (p) => { await db.delete('promptSets', p.id); reload(); };
+  const save = async (draft) => {
+    const now = nowIso();
+    const next = isNew
+      ? { id: uid('pset'), createdAt: now, updatedAt: now, ...draft }
+      : { ...draft, updatedAt: now };
+    await db.put('promptSets', next);
+    setEditing(null);
+    reload();
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-semibold">프롬프트 세트</h2>
+        <button className="btn btn-primary" onClick={create}>+ 새 세트</button>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {promptSets.map(p => {
+          const enabled = p.prompts.filter(s=>s.enabled).length;
+          return (
+            <div key={p.id} className="card p-4 space-y-2">
+              <div className="flex items-start justify-between">
+                <div>
+                  <div className="font-semibold">{p.name}</div>
+                  <div className="text-xs text-slate-400">{enabled}/{p.prompts.length} 활성 슬롯</div>
+                </div>
+                <div className="flex gap-1">
+                  <button className="btn btn-ghost" onClick={()=>edit(p)}>편집</button>
+                  <button className="btn btn-ghost" onClick={()=>dup(p)}>복제</button>
+                  <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={()=>del(p)}>삭제</ConfirmButton>
+                </div>
+              </div>
+              <div className="text-xs text-slate-400 line-clamp-2">{p.description}</div>
+              <ul className="text-xs space-y-1 mt-1">
+                {p.prompts.slice(0,8).map(s => (
+                  <li key={s.id} className="flex items-center gap-2">
+                    <span className={s.enabled ? 'text-slate-200' : 'text-slate-500 line-through'}>{pad(s.order, 2)} · {s.title}</span>
+                  </li>
+                ))}
+                {p.prompts.length > 8 && <li className="text-slate-500">… +{p.prompts.length-8}개</li>}
+              </ul>
+            </div>
+          );
+        })}
+        {promptSets.length === 0 && <div className="text-slate-500 col-span-full">프롬프트 세트가 없습니다.</div>}
+      </div>
+      {editing && <PromptSetEditor key={isNew?'new':editing.id} initial={isNew?null:editing} onCancel={()=>setEditing(null)} onSave={save} />}
+    </div>
+  );
+}
+
+function PromptSetEditor({ initial, onCancel, onSave }) {
+  const [draft, setDraft] = useState(initial || { name: '', description: '', prompts: [] });
+  const upd = (patch) => setDraft(d => ({ ...d, ...patch }));
+  const reorder = () => setDraft(d => ({ ...d, prompts: d.prompts.map((s,i)=>({ ...s, order: i+1 })) }));
+  const addSlot = () => setDraft(d => ({ ...d, prompts: [...d.prompts, { id: uid('slot'), order: d.prompts.length+1, title: `slot_${d.prompts.length+1}`, prompt: '', enabled: true }] }));
+  const updateSlot = (id, patch) => setDraft(d => ({ ...d, prompts: d.prompts.map(s => s.id===id ? { ...s, ...patch } : s) }));
+  const removeSlot = (id) => setDraft(d => ({ ...d, prompts: d.prompts.filter(s=>s.id!==id) }));
+  const move = (id, dir) => setDraft(d => {
+    const idx = d.prompts.findIndex(s=>s.id===id);
+    if (idx<0) return d;
+    const j = idx + dir;
+    if (j<0 || j>=d.prompts.length) return d;
+    const arr = [...d.prompts];
+    [arr[idx], arr[j]] = [arr[j], arr[idx]];
+    return { ...d, prompts: arr.map((s,i)=>({ ...s, order: i+1 })) };
+  });
+
+  useEffect(reorder, []); // initial normalize
+
+  const valid = draft.name.trim().length > 0;
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onCancel}>
+      <div className="card p-5 w-full max-w-4xl space-y-3 max-h-[90vh] overflow-auto" onClick={e=>e.stopPropagation()}>
+        <h3 className="text-lg font-semibold">{initial?'프롬프트 세트 편집':'새 프롬프트 세트'}</h3>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="이름"><input className="input" value={draft.name} onChange={e=>upd({name:e.target.value})} /></Field>
+          <Field label="설명"><input className="input" value={draft.description||''} onChange={e=>upd({description:e.target.value})} /></Field>
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="text-sm text-slate-300">슬롯 ({draft.prompts.length})</div>
+          <button className="btn" onClick={addSlot}>+ 슬롯 추가</button>
+        </div>
+        <div className="space-y-2">
+          {draft.prompts.map((s, i) => (
+            <div key={s.id} className="card p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <span className="mono text-xs text-slate-400 w-8">{pad(i+1,2)}</span>
+                <input className="input flex-1" value={s.title} onChange={e=>updateSlot(s.id,{title:e.target.value})} placeholder="제목 (파일명에 사용)" />
+                <label className="text-xs flex items-center gap-1"><input type="checkbox" checked={s.enabled} onChange={e=>updateSlot(s.id,{enabled:e.target.checked})} /> 활성</label>
+                <button className="btn btn-ghost" onClick={()=>move(s.id,-1)}>↑</button>
+                <button className="btn btn-ghost" onClick={()=>move(s.id,+1)}>↓</button>
+                <button className="btn btn-ghost text-red-400" onClick={()=>removeSlot(s.id)}>×</button>
+              </div>
+              <textarea className="input mono" value={s.prompt} onChange={e=>updateSlot(s.id,{prompt:e.target.value})} placeholder="프롬프트" />
+              <textarea className="input mono" value={s.negativePrompt||''} onChange={e=>updateSlot(s.id,{negativePrompt:e.target.value})} placeholder="(선택) 슬롯별 네거티브 — 비우면 캐릭터/기본값 사용" />
+            </div>
+          ))}
+          {draft.prompts.length === 0 && <div className="text-slate-500 text-sm">슬롯이 없습니다.</div>}
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <button className="btn" onClick={onCancel}>취소</button>
+          <button className="btn btn-primary" onClick={()=>onSave(draft)} disabled={!valid}>저장</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PresetForm({ preset, onChange }) {
+  const upd = (patch) => onChange({ ...preset, ...patch });
+  return (
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+      <Field label="모델">
+        <select className="input" value={preset.model} onChange={e=>upd({model:e.target.value})}>
+          {MODELS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+        </select>
+      </Field>
+      <Field label="해상도">
+        <select className="input" value={`${preset.width}x${preset.height}`} onChange={e=>{ const [w,h] = e.target.value.split('x').map(Number); upd({width:w,height:h}); }}>
+          {RESOLUTIONS.map(r => <option key={`${r.w}x${r.h}`} value={`${r.w}x${r.h}`}>{r.label}</option>)}
+        </select>
+      </Field>
+      <Field label="샘플러">
+        <select className="input" value={preset.sampler} onChange={e=>upd({sampler:e.target.value})}>
+          {SAMPLERS.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+      </Field>
+      <Field label="Steps"><input className="input" type="number" value={preset.steps} onChange={e=>upd({steps:Number(e.target.value)||1})} /></Field>
+      <Field label="CFG Scale"><input className="input" type="number" step="0.1" value={preset.cfgScale} onChange={e=>upd({cfgScale:Number(e.target.value)||1})} /></Field>
+      <Field label="SMEA">
+        <div className="flex gap-3 items-center pt-2">
+          <label className="text-sm flex items-center gap-1"><input type="checkbox" checked={!!preset.smea} onChange={e=>upd({smea:e.target.checked})} /> SMEA</label>
+          <label className="text-sm flex items-center gap-1"><input type="checkbox" checked={!!preset.smeaDyn} onChange={e=>upd({smeaDyn:e.target.checked})} /> SMEA dyn</label>
+        </div>
+      </Field>
+    </div>
+  );
+}
+
+function BatchRunPage({ characters, promptSets, settings }) {
+  const r = useStore(runner);
+  const [selectedChars, setSelectedChars] = useState([]);
+  const [promptSetId, setPromptSetId] = useState(promptSets[0]?.id || '');
+  const [sessionName, setSessionName] = useState('');
+  const [preset, setPreset] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('nai-preset')) || DEFAULT_PRESET; } catch { return DEFAULT_PRESET; }
+  });
+  const [queue, setQueue] = useState([]); // current preview / running jobs
+  const [sessionObj, setSessionObj] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => { localStorage.setItem('nai-preset', JSON.stringify(preset)); }, [preset]);
+  useEffect(() => { if (!promptSetId && promptSets[0]) setPromptSetId(promptSets[0].id); }, [promptSets]);
+
+  const promptSet = promptSets.find(p => p.id === promptSetId);
+  const selectedCharObjs = useMemo(() => characters.filter(c => selectedChars.includes(c.id)), [characters, selectedChars]);
+  const enabledSlotCount = promptSet ? promptSet.prompts.filter(s => s.enabled).length : 0;
+  const expectedJobs = selectedCharObjs.length * enabledSlotCount;
+
+  // live job updates while running
+  useEffect(() => {
+    if (!r.sessionId) return;
+    let alive = true;
+    const tick = async () => {
+      const list = await db.jobsBySession(r.sessionId);
+      if (alive) setQueue(list.sort((a,b)=>a.order-b.order));
+    };
+    tick();
+    const iv = setInterval(tick, r.isRunning ? 700 : 2500);
+    return () => { alive = false; clearInterval(iv); };
+  }, [r.sessionId, r.isRunning]);
+
+  const toggleChar = (id) => setSelectedChars(prev => prev.includes(id) ? prev.filter(x=>x!==id) : [...prev, id]);
+
+  const createQueue = async () => {
+    setError('');
+    if (!settings.apiToken) return setError('API 토큰이 설정되지 않았습니다.');
+    if (!selectedCharObjs.length) return setError('캐릭터를 1명 이상 선택하세요.');
+    if (!promptSet) return setError('프롬프트 세트를 선택하세요.');
+    if (!enabledSlotCount) return setError('활성화된 프롬프트 슬롯이 없습니다.');
+    const rootDir = await getStoredOutputDir();
+    if (!rootDir) return setError('출력 폴더가 선택되지 않았습니다. 설정에서 폴더를 선택하세요.');
+
+    const sid = uid('sess');
+    const session = {
+      id: sid,
+      name: sessionName.trim() || promptSet.name,
+      startedAt: nowIso(),
+      completedAt: null,
+      preset,
+      characterIds: selectedCharObjs.map(c=>c.id),
+      promptSetId: promptSet.id,
+    };
+    const jobs = buildQueue({ characters: selectedCharObjs, promptSet, sessionId: sid });
+    await db.put('sessions', session);
+    await db.bulkPut('jobs', jobs);
+    setSessionObj(session);
+    setQueue(jobs);
+    runner.set(s => ({ ...s, sessionId: sid }));
+  };
+
+  const start = async () => {
+    setError('');
+    const rootDir = await getStoredOutputDir();
+    if (!rootDir) return setError('출력 폴더 권한이 필요합니다.');
+    const jobs = (await db.jobsBySession(sessionObj?.id || runner.get().sessionId)).sort((a,b)=>a.order-b.order);
+    if (!jobs.length) return setError('큐가 비었습니다.');
+    const session = sessionObj || await db.get('sessions', runner.get().sessionId);
+    startRun({ session, jobs, preset: session.preset, settings, rootDir }).catch(e => { rlog('error', String(e.message||e)); });
+  };
+
+  const pause = () => runner.set(s => ({ ...s, isPaused: true }));
+  const resume = () => runner.set(s => ({ ...s, isPaused: false }));
+  const stop = () => runner.set(s => ({ ...s, isCancelling: true, isPaused: false }));
+  const retryFailed = async () => {
+    if (!runner.get().sessionId) return;
+    const jobs = await db.jobsBySession(runner.get().sessionId);
+    const failed = jobs.filter(j => j.status === 'failed');
+    if (!failed.length) return;
+    for (const j of failed) {
+      await db.put('jobs', { ...j, status: 'pending', retryCount: 0, errorMessage: undefined, completedAt: undefined });
+    }
+    const rootDir = await getStoredOutputDir();
+    if (!rootDir) return setError('출력 폴더 권한이 필요합니다.');
+    const session = await db.get('sessions', runner.get().sessionId);
+    const fresh = (await db.jobsBySession(session.id)).sort((a,b)=>a.order-b.order);
+    startRun({ session, jobs: fresh, preset: session.preset, settings, rootDir }).catch(e => { rlog('error', String(e.message||e)); });
+  };
+
+  const progress = useMemo(() => {
+    const total = queue.length;
+    const done = queue.filter(j => ['success','failed','skipped','cancelled'].includes(j.status)).length;
+    return { total, done, pct: total ? Math.round(done/total*100) : 0 };
+  }, [queue]);
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-xl font-semibold">배치 실행</h2>
+
+      {error && <div className="card p-3 border-red-500/40 text-red-300 text-sm">{error}</div>}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="card p-4 space-y-3">
+          <div className="font-semibold">캐릭터 선택 <span className="text-xs text-slate-400">({selectedChars.length}/{characters.length})</span></div>
+          <div className="flex gap-2 text-xs">
+            <button className="btn btn-ghost" onClick={()=>setSelectedChars(characters.map(c=>c.id))}>전체</button>
+            <button className="btn btn-ghost" onClick={()=>setSelectedChars([])}>해제</button>
+          </div>
+          <div className="max-h-72 overflow-auto space-y-1">
+            {characters.map(c => (
+              <label key={c.id} className={`flex items-center gap-2 p-2 rounded-lg cursor-pointer ${selectedChars.includes(c.id)?'bg-blue-900/30':'hover:bg-slate-800/40'}`}>
+                <input type="checkbox" checked={selectedChars.includes(c.id)} onChange={()=>toggleChar(c.id)} />
+                <span className="flex-1 truncate">{c.name}</span>
+                <span className="text-xs text-slate-500 mono truncate max-w-[40%]">{c.basePrompt?.slice(0,60)}</span>
+              </label>
+            ))}
+            {characters.length === 0 && <div className="text-slate-500 text-sm p-2">캐릭터를 먼저 추가하세요.</div>}
+          </div>
+        </div>
+        <div className="card p-4 space-y-3">
+          <div className="font-semibold">프롬프트 세트</div>
+          <select className="input" value={promptSetId} onChange={e=>setPromptSetId(e.target.value)}>
+            <option value="">선택 안 함</option>
+            {promptSets.map(p => <option key={p.id} value={p.id}>{p.name} ({p.prompts.filter(s=>s.enabled).length}/{p.prompts.length})</option>)}
+          </select>
+          {promptSet && (
+            <ul className="text-sm max-h-56 overflow-auto space-y-1">
+              {promptSet.prompts.map(s => (
+                <li key={s.id} className={`flex items-center gap-2 ${s.enabled?'':'text-slate-500 line-through'}`}>
+                  <span className="mono text-xs text-slate-400 w-8">{pad(s.order,2)}</span>
+                  <span className="truncate flex-1">{s.title}</span>
+                  <span className="text-xs text-slate-500 mono truncate max-w-[50%]">{s.prompt.slice(0,80)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <Field label="세션 이름 (선택)"><input className="input" value={sessionName} onChange={e=>setSessionName(e.target.value)} placeholder="비우면 프롬프트 세트 이름 사용" /></Field>
+        </div>
+      </div>
+
+      <div className="card p-4 space-y-3">
+        <div className="font-semibold">생성 프리셋</div>
+        <PresetForm preset={preset} onChange={setPreset} />
+      </div>
+
+      <div className="card p-4 space-y-3">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="font-semibold">
+            큐 ({queue.length || expectedJobs} jobs)
+            {queue.length > 0 && <span className="text-xs text-slate-400 ml-2">진행 {progress.done}/{progress.total} · {progress.pct}%</span>}
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            <button className="btn" disabled={r.isRunning} onClick={createQueue}>큐 생성</button>
+            <button className="btn btn-primary" disabled={r.isRunning || !queue.length} onClick={start}>실행</button>
+            {!r.isPaused
+              ? <button className="btn" disabled={!r.isRunning} onClick={pause}>일시정지</button>
+              : <button className="btn" disabled={!r.isRunning} onClick={resume}>재개</button>}
+            <button className="btn btn-danger" disabled={!r.isRunning} onClick={stop}>중단</button>
+            <button className="btn" disabled={r.isRunning || !queue.some(j=>j.status==='failed')} onClick={retryFailed}>실패 재시도</button>
+          </div>
+        </div>
+        {r.isRunning && r.current && (
+          <div className="text-sm text-slate-300">
+            진행 중: <span className="mono">#{pad(r.current.index)}/{r.current.total}</span> · {r.current.characterName} / {r.current.promptTitle}
+            {r.isPaused && <span className="badge badge-pending ml-2">일시정지</span>}
+            {r.isCancelling && <span className="badge badge-cancelled ml-2">중단 중</span>}
+          </div>
+        )}
+        <div className="w-full bg-slate-800/60 rounded-full h-2 overflow-hidden">
+          <div className="bg-blue-500 h-2 transition-all" style={{ width: `${progress.pct}%` }} />
+        </div>
+        <QueueTable jobs={queue} />
+      </div>
+
+      <RunnerLogs />
+    </div>
+  );
+}
+
+function QueueTable({ jobs }) {
+  if (!jobs.length) return <div className="text-slate-500 text-sm">큐가 비었습니다. “큐 생성”을 누르세요.</div>;
+  return (
+    <div className="overflow-auto max-h-96">
+      <table className="w-full text-sm">
+        <thead className="text-xs text-slate-400 sticky top-0 bg-[#131826]">
+          <tr><th className="text-left p-2">#</th><th className="text-left p-2">캐릭터</th><th className="text-left p-2">프롬프트</th><th className="text-left p-2">상태</th><th className="text-left p-2">seed</th><th className="text-left p-2">재시도</th><th className="text-left p-2">경로/오류</th></tr>
+        </thead>
+        <tbody>
+          {jobs.map(j => (
+            <tr key={j.id} className="row-hover border-t border-slate-800/60">
+              <td className="p-2 mono">{pad(j.order)}</td>
+              <td className="p-2">{j.characterName}</td>
+              <td className="p-2 truncate max-w-[200px]">{j.promptTitle}</td>
+              <td className="p-2"><Badge status={j.status} /></td>
+              <td className="p-2 mono text-xs">{j.seed ?? '-'}</td>
+              <td className="p-2 mono text-xs">{j.retryCount || 0}</td>
+              <td className="p-2 text-xs truncate max-w-[280px]" title={j.errorMessage || j.outputPath}>{j.errorMessage ? <span className="text-red-400">{j.errorMessage}</span> : (j.outputPath || '')}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RunnerLogs() {
+  const r = useStore(runner);
+  if (!r.logs.length) return null;
+  return (
+    <div className="card p-3">
+      <div className="text-sm text-slate-300 mb-2">로그</div>
+      <div className="max-h-48 overflow-auto mono text-xs space-y-1">
+        {r.logs.slice(-200).map((l,i) => (
+          <div key={i} className={l.level==='error'?'text-red-400':l.level==='warn'?'text-amber-300':'text-slate-300'}>
+            <span className="text-slate-500 mr-2">{l.ts.slice(11,19)}</span><span className="uppercase mr-2">{l.level}</span>{l.msg}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SessionsPage({ characters, promptSets }) {
+  const [sessions, setSessions] = useState([]);
+  const [openId, setOpenId] = useState(null);
+  const [jobs, setJobs] = useState([]);
+
+  const reload = async () => {
+    const ss = await db.getAll('sessions');
+    setSessions(ss.sort((a,b)=> (b.startedAt||'').localeCompare(a.startedAt||'')));
+  };
+  useEffect(() => { reload(); }, []);
+  useEffect(() => {
+    if (!openId) { setJobs([]); return; }
+    db.jobsBySession(openId).then(js => setJobs(js.sort((a,b)=>a.order-b.order)));
+  }, [openId]);
+
+  const del = async (id) => {
+    await db.delete('sessions', id);
+    const jobs = await db.jobsBySession(id);
+    for (const j of jobs) await db.delete('jobs', j.id);
+    if (openId === id) setOpenId(null);
+    reload();
+  };
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-xl font-semibold">세션 기록</h2>
+      <div className="card divide-y divide-slate-800/60">
+        {sessions.map(s => (
+          <div key={s.id} className="p-3">
+            <div className="flex items-center gap-3 cursor-pointer" onClick={()=>setOpenId(openId===s.id?null:s.id)}>
+              <div className="flex-1">
+                <div className="font-medium">{s.name}</div>
+                <div className="text-xs text-slate-400 mono">{fmtDate(s.startedAt)} · 캐릭터 {s.characterIds.length} · 프리셋 {s.preset?.model}</div>
+              </div>
+              <div className="text-xs text-slate-400">{s.completedAt ? '완료' : '진행 중'}</div>
+              <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={()=>del(s.id)}>삭제</ConfirmButton>
+            </div>
+            {openId === s.id && (
+              <div className="mt-3"><QueueTable jobs={jobs} /></div>
+            )}
+          </div>
+        ))}
+        {sessions.length === 0 && <div className="p-4 text-slate-500 text-sm">세션이 없습니다.</div>}
+      </div>
+    </div>
+  );
+}
+
+function DashboardPage({ characters, promptSets }) {
+  const [sessions, setSessions] = useState([]);
+  useEffect(() => { db.getAll('sessions').then(s => setSessions(s.sort((a,b)=>(b.startedAt||'').localeCompare(a.startedAt||'')))); }, []);
+  const recent = sessions.slice(0,5);
+  return (
+    <div className="space-y-4">
+      <h2 className="text-xl font-semibold">대시보드</h2>
+      <div className="grid grid-cols-3 gap-3">
+        <Stat label="캐릭터" value={characters.length} />
+        <Stat label="프롬프트 세트" value={promptSets.length} />
+        <Stat label="세션" value={sessions.length} />
+      </div>
+      <div className="card p-4">
+        <div className="font-semibold mb-2">최근 세션</div>
+        {recent.length === 0 && <div className="text-slate-500 text-sm">아직 실행 기록이 없습니다.</div>}
+        <ul className="divide-y divide-slate-800/60">
+          {recent.map(s => (
+            <li key={s.id} className="py-2 text-sm flex items-center gap-3">
+              <span className="flex-1">{s.name}</span>
+              <span className="text-xs text-slate-400 mono">{fmtDate(s.startedAt)}</span>
+              <span className="text-xs">{s.completedAt ? '완료' : '진행 중'}</span>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="card p-4 text-sm text-slate-300 leading-relaxed">
+        <div className="font-semibold mb-2">사용 흐름</div>
+        <ol className="list-decimal pl-5 space-y-1">
+          <li>설정에서 NovelAI 토큰을 입력하고 출력 폴더를 선택합니다.</li>
+          <li>캐릭터를 등록하고 각자의 basePrompt 를 설정합니다.</li>
+          <li>프롬프트 세트를 만들어 슬롯들을 등록합니다 (예: 기본 8장 세트).</li>
+          <li>배치 실행에서 캐릭터들과 세트를 선택 → 큐 생성 → 실행 합니다.</li>
+          <li>이미지는 <span className="mono">출력폴더/{`{날짜_세션명}`}/{`{캐릭터명}`}/{`{순번_제목_seed}.png`}</span> 형식으로 저장됩니다.</li>
+        </ol>
+      </div>
+    </div>
+  );
+}
+function Stat({ label, value }) {
+  return <div className="card p-4"><div className="text-xs text-slate-400">{label}</div><div className="text-2xl font-semibold mt-1">{value}</div></div>;
+}
+
+/* ============ App Shell ============ */
+const PAGES = [
+  { id: 'dashboard', label: '대시보드' },
+  { id: 'characters', label: '캐릭터' },
+  { id: 'prompts', label: '프롬프트 세트' },
+  { id: 'batch', label: '배치 실행' },
+  { id: 'sessions', label: '세션 기록' },
+  { id: 'settings', label: '설정' },
+];
+
+function App() {
+  const [page, setPage] = useState('dashboard');
+  const [settings, setSettings] = useState(loadSettings());
+  const [characters, setCharacters] = useState([]);
+  const [promptSets, setPromptSets] = useState([]);
+
+  const reloadChars = useCallback(() => db.getAll('characters').then(setCharacters), []);
+  const reloadSets = useCallback(() => db.getAll('promptSets').then(setPromptSets), []);
+
+  useEffect(() => { reloadChars(); reloadSets(); }, [reloadChars, reloadSets]);
+
+  // seed with example data on first run
+  useEffect(() => {
+    (async () => {
+      const seeded = await kvGet('seeded', false);
+      if (seeded) return;
+      const chars = await db.getAll('characters');
+      const sets = await db.getAll('promptSets');
+      if (chars.length === 0 && sets.length === 0) {
+        const now = nowIso();
+        await db.put('characters', {
+          id: uid('char'), name: '남궁현아',
+          basePrompt: 'black hair, elegant wuxia swordswoman, blue-white hanfu, calm expression',
+          negativePrompt: 'bad anatomy, low quality, extra fingers',
+          defaultSeedMode: 'random', outputFolderName: '남궁현아',
+          createdAt: now, updatedAt: now, tags: [],
+        });
+        const slots = [
+          ['standing_full_body', 'standing, full body, looking at viewer'],
+          ['portrait', 'close-up portrait, soft smile'],
+          ['battle_stance', 'battle stance, sword drawn'],
+          ['sitting', 'sitting on wooden chair'],
+          ['walking', 'walking through old street'],
+          ['back_view', 'back view, wind blowing hair'],
+          ['dramatic', 'dramatic lighting, serious expression'],
+          ['cover', 'poster composition, cinematic framing'],
+        ];
+        await db.put('promptSets', {
+          id: uid('pset'), name: '기본 8장 세트', description: '설계 문서 예시 세트',
+          prompts: slots.map(([title, prompt], i) => ({ id: uid('slot'), order: i+1, title, prompt, enabled: true })),
+          createdAt: now, updatedAt: now,
+        });
+        await kvSet('seeded', true);
+        reloadChars(); reloadSets();
+      } else {
+        await kvSet('seeded', true);
+      }
+    })();
+  }, [reloadChars, reloadSets]);
+
+  const r = useStore(runner);
+
+  return (
+    <div className="h-full flex">
+      <aside className="w-64 shrink-0 border-r border-slate-800/60 p-3 flex flex-col gap-1">
+        <div className="px-2 py-3">
+          <div className="text-base font-semibold">NAI Batch Runner</div>
+          <div className="text-xs text-slate-400">캐릭터 × 프롬프트 자동 순회</div>
+        </div>
+        {PAGES.map(p => (
+          <div key={p.id} className={`nav-item ${page===p.id?'active':''}`} onClick={()=>setPage(p.id)}>
+            <span>{p.label}</span>
+          </div>
+        ))}
+        <div className="mt-auto p-2 text-xs text-slate-500 space-y-1">
+          <div>토큰: <span className="mono">{maskToken(settings.apiToken)||'(없음)'}</span></div>
+          <div>실행: <span className={r.isRunning?'text-emerald-400':'text-slate-400'}>{r.isRunning?(r.isPaused?'paused':'running'):'idle'}</span></div>
+        </div>
+      </aside>
+      <main className="flex-1 overflow-auto p-6">
+        {page === 'dashboard' && <DashboardPage characters={characters} promptSets={promptSets} />}
+        {page === 'characters' && <CharactersPage characters={characters} reload={reloadChars} />}
+        {page === 'prompts' && <PromptSetsPage promptSets={promptSets} reload={reloadSets} />}
+        {page === 'batch' && <BatchRunPage characters={characters} promptSets={promptSets} settings={settings} />}
+        {page === 'sessions' && <SessionsPage characters={characters} promptSets={promptSets} />}
+        {page === 'settings' && <SettingsPage settings={settings} setSettings={setSettings} />}
+      </main>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+  </script>
+</body>
+</html>

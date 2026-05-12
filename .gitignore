@@ -1,0 +1,23 @@
+# Local dev artifacts
+pdf_text.txt
+
+# Claude Code local-only settings (machine-specific)
+.claude/settings.local.json
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (in case Tauri/Vite path is added later)
+node_modules/
+dist/
+build/
+.env
+.env.local
+*.log
