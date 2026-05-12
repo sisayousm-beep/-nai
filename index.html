@@ -62,6 +62,32 @@ const fmtDate = (iso) => { try { return new Date(iso).toLocaleString(); } catch 
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const randSeed = () => Math.floor(Math.random() * 2**32);
 
+/* NAIS weight syntax (N::content::) → NovelAI ({{{content}}} / [[content]]) */
+function naisToNovelAi(text) {
+  if (!text) return text;
+  return String(text).replace(/(-?\d+)::(.+?)::/g, (_, n, body) => {
+    const num = parseInt(n, 10) | 0;
+    if (num > 0) return '{'.repeat(num) + body + '}'.repeat(num);
+    if (num < 0) return '['.repeat(-num) + body + ']'.repeat(-num);
+    return body;
+  });
+}
+function downloadBlob(filename, blob) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function pickJsonFile() {
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type = 'file'; input.accept = 'application/json,.json';
+    input.onchange = () => resolve(input.files?.[0] || null);
+    input.click();
+  });
+}
+
 /* ============ IndexedDB ============ */
 const DB_NAME = 'nai-batch-runner';
 const DB_VERSION = 1;
@@ -155,6 +181,59 @@ function maskToken(t) {
   return `${t.slice(0,4)}••••••••${t.slice(-4)}`;
 }
 
+/* ============ NAIS Preset import/export ============
+   NAIS 포맷:
+   { id, name, scenes: [{ id, name, scenePrompt, width?, height?, ... }], createdAt }
+   내부 PromptSet 포맷:
+   { id, name, description?, prompts: [{ id, order, title, prompt, negativePrompt?, enabled, width?, height? }], createdAt, updatedAt }
+*/
+function naisPresetToPromptSet(nais) {
+  if (!nais || typeof nais !== 'object') throw new Error('JSON 형식이 올바르지 않습니다.');
+  const scenes = Array.isArray(nais.scenes) ? nais.scenes : null;
+  if (!scenes) throw new Error('NAIS preset JSON에 scenes 배열이 없습니다.');
+  const now = nowIso();
+  return {
+    id: uid('pset'),
+    name: String(nais.name || 'Imported preset').trim() || 'Imported preset',
+    description: nais.id ? `NAIS preset id ${nais.id} 에서 가져옴` : 'NAIS preset 에서 가져옴',
+    prompts: scenes.map((sc, i) => ({
+      id: uid('slot'),
+      order: i + 1,
+      title: String(sc.name ?? `slot_${i+1}`).trim() || `slot_${i+1}`,
+      prompt: String(sc.scenePrompt || '').trim(),
+      negativePrompt: sc.negativePrompt ? String(sc.negativePrompt) : undefined,
+      enabled: sc.enabled !== false,
+      width: Number.isFinite(sc.width) ? sc.width : undefined,
+      height: Number.isFinite(sc.height) ? sc.height : undefined,
+    })),
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+function promptSetToNaisPreset(set) {
+  const ts = Date.now();
+  return {
+    id: String(ts),
+    name: set.name,
+    scenes: set.prompts.map((s, i) => {
+      const scene = {
+        id: String(ts + i),
+        name: s.title,
+        scenePrompt: s.prompt,
+        queueCount: 0,
+        images: [],
+        createdAt: ts + i,
+      };
+      if (s.negativePrompt) scene.negativePrompt = s.negativePrompt;
+      if (s.enabled === false) scene.enabled = false;
+      if (s.width) scene.width = s.width;
+      if (s.height) scene.height = s.height;
+      return scene;
+    }),
+    createdAt: ts,
+  };
+}
+
 /* ============ Models / Defaults ============ */
 const MODELS = [
   { id: 'nai-diffusion-4-5-full', label: 'NAI Diffusion v4.5 Full' },
@@ -217,14 +296,14 @@ function composePrompt(character, slot) {
   const parts = [];
   if (character.basePrompt?.trim()) parts.push(character.basePrompt.trim());
   if (slot.prompt?.trim()) parts.push(slot.prompt.trim());
-  return parts.join(', ');
+  return naisToNovelAi(parts.join(', '));
 }
 function composeNegativePrompt(character, slot) {
   const parts = [];
   if (slot.negativePrompt?.trim()) parts.push(slot.negativePrompt.trim());
   else if (character.negativePrompt?.trim()) parts.push(character.negativePrompt.trim());
   if (!parts.length) parts.push(DEFAULT_NEG);
-  return parts.join(', ');
+  return naisToNovelAi(parts.join(', '));
 }
 
 /* ============ Seed policy ============ */
@@ -257,6 +336,8 @@ function buildQueue({ characters, promptSet, sessionId }) {
         order,
         finalPrompt: composePrompt(character, slot),
         finalNegativePrompt: composeNegativePrompt(character, slot),
+        width: slot.width || undefined,
+        height: slot.height || undefined,
         status: 'pending',
         retryCount: 0,
         createdAt: nowIso(),
@@ -269,14 +350,16 @@ function buildQueue({ characters, promptSet, sessionId }) {
 
 /* ============ NovelAI API ============ */
 function buildPayload({ job, preset, seed }) {
+  const width = job.width || preset.width;
+  const height = job.height || preset.height;
   return {
     input: job.finalPrompt,
     model: preset.model,
     action: 'generate',
     parameters: {
       params_version: 3,
-      width: preset.width,
-      height: preset.height,
+      width,
+      height,
       scale: preset.cfgScale,
       sampler: preset.sampler,
       steps: preset.steps,
@@ -377,23 +460,27 @@ async function findUnusedFilename(dir, baseName) {
 }
 
 async function saveJobResult({ rootDir, session, job, preset, seed, imageBlob }) {
+  const width = job.width || preset.width;
+  const height = job.height || preset.height;
   const sessionDirName = `${session.startedAt.replace(/[:T]/g,'-').replace(/\..+$/,'')}_${sanitizeFs(session.name)}`;
   const sessionDir = await ensureDir(rootDir, sessionDirName);
   const charDir = await ensureDir(sessionDir, job.characterName);
-  const baseName = `${pad(job.order)}_${sanitizeFs(job.promptTitle)}_${seed}`;
+  const titleSafe = sanitizeFs(job.promptTitle);
+  const baseName = `${titleSafe}_${seed}`;
   const pngName = await findUnusedFilename(charDir, `${baseName}.png`);
   const jsonName = pngName.replace(/\.png$/i, '.json');
   await writeFile(charDir, pngName, imageBlob);
   const meta = {
     sessionId: session.id,
     jobId: job.id,
+    order: job.order,
     characterName: job.characterName,
     promptTitle: job.promptTitle,
     finalPrompt: job.finalPrompt,
     finalNegativePrompt: job.finalNegativePrompt,
     model: preset.model,
-    width: preset.width,
-    height: preset.height,
+    width,
+    height,
     steps: preset.steps,
     cfgScale: preset.cfgScale,
     sampler: preset.sampler,
@@ -721,6 +808,7 @@ function CharacterEditor({ initial, onCancel, onSave }) {
 
 function PromptSetsPage({ promptSets, reload }) {
   const [editing, setEditing] = useState(null);
+  const [importMsg, setImportMsg] = useState('');
   const isNew = editing === 'new';
   const create = () => setEditing('new');
   const edit = (p) => setEditing(clone(p));
@@ -741,12 +829,47 @@ function PromptSetsPage({ promptSets, reload }) {
     reload();
   };
 
+  const importFromFile = async () => {
+    setImportMsg('');
+    const file = await pickJsonFile();
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const json = JSON.parse(text);
+      const set = naisPresetToPromptSet(json);
+      await db.put('promptSets', set);
+      setImportMsg(`✓ "${set.name}" — 슬롯 ${set.prompts.length}개 가져옴`);
+      reload();
+    } catch (e) {
+      setImportMsg(`✗ 가져오기 실패: ${e.message || e}`);
+    }
+  };
+  const exportSet = (p) => {
+    const nais = promptSetToNaisPreset(p);
+    const fname = `NAIS_Preset_${sanitizeFs(p.name)}_${Date.now()}.json`;
+    downloadBlob(fname, new Blob([JSON.stringify(nais, null, 2)], { type: 'application/json' }));
+  };
+  const exportAll = () => {
+    const backup = {
+      kind: 'nai-batch-runner.backup',
+      version: 1,
+      exportedAt: nowIso(),
+      promptSets: promptSets.map(p => promptSetToNaisPreset(p)),
+    };
+    downloadBlob(`NAI_PromptSets_backup_${Date.now()}.json`, new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }));
+  };
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="text-xl font-semibold">프롬프트 세트</h2>
-        <button className="btn btn-primary" onClick={create}>+ 새 세트</button>
+        <div className="flex gap-2 flex-wrap">
+          <button className="btn" onClick={importFromFile}>JSON 가져오기 (NAIS)</button>
+          <button className="btn" onClick={exportAll} disabled={!promptSets.length}>전체 백업 내보내기</button>
+          <button className="btn btn-primary" onClick={create}>+ 새 세트</button>
+        </div>
       </div>
+      {importMsg && <div className={`card p-3 text-sm ${importMsg.startsWith('✓')?'text-emerald-300':'text-red-300'}`}>{importMsg}</div>}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {promptSets.map(p => {
           const enabled = p.prompts.filter(s=>s.enabled).length;
@@ -757,8 +880,9 @@ function PromptSetsPage({ promptSets, reload }) {
                   <div className="font-semibold">{p.name}</div>
                   <div className="text-xs text-slate-400">{enabled}/{p.prompts.length} 활성 슬롯</div>
                 </div>
-                <div className="flex gap-1">
+                <div className="flex gap-1 flex-wrap">
                   <button className="btn btn-ghost" onClick={()=>edit(p)}>편집</button>
+                  <button className="btn btn-ghost" onClick={()=>exportSet(p)}>내보내기</button>
                   <button className="btn btn-ghost" onClick={()=>dup(p)}>복제</button>
                   <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={()=>del(p)}>삭제</ConfirmButton>
                 </div>
@@ -827,6 +951,13 @@ function PromptSetEditor({ initial, onCancel, onSave }) {
               </div>
               <textarea className="input mono" value={s.prompt} onChange={e=>updateSlot(s.id,{prompt:e.target.value})} placeholder="프롬프트" />
               <textarea className="input mono" value={s.negativePrompt||''} onChange={e=>updateSlot(s.id,{negativePrompt:e.target.value})} placeholder="(선택) 슬롯별 네거티브 — 비우면 캐릭터/기본값 사용" />
+              <div className="flex items-center gap-2 text-xs text-slate-400">
+                <span>해상도 오버라이드:</span>
+                <input className="input mono w-24" type="number" min="0" step="64" placeholder="width" value={s.width||''} onChange={e=>updateSlot(s.id,{width: e.target.value?Number(e.target.value):undefined})} />
+                <span>×</span>
+                <input className="input mono w-24" type="number" min="0" step="64" placeholder="height" value={s.height||''} onChange={e=>updateSlot(s.id,{height: e.target.value?Number(e.target.value):undefined})} />
+                <span className="text-slate-500">(비우면 프리셋 해상도 사용)</span>
+              </div>
             </div>
           ))}
           {draft.prompts.length === 0 && <div className="text-slate-500 text-sm">슬롯이 없습니다.</div>}
