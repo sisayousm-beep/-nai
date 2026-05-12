@@ -89,6 +89,24 @@ function pickJsonFile() {
     input.click();
   });
 }
+function pickImageFiles(multiple=true) {
+  return new Promise(resolve => {
+    const input = document.createElement('input');
+    input.type = 'file'; input.accept = 'image/*'; input.multiple = multiple;
+    input.onchange = () => resolve(Array.from(input.files || []));
+    input.click();
+  });
+}
+async function blobToBase64(blob) {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
 
 /* ============ IndexedDB ============ */
 const DB_NAME = 'nai-batch-runner';
@@ -382,9 +400,15 @@ function buildQueue({ characters, promptSet, sessionId, batch, preset }) {
 }
 
 /* ============ NovelAI API ============ */
-function buildPayload({ job, preset, seed }) {
+function buildPayload({ job, preset, seed, refs }) {
   const width = job.width || preset.width;
   const height = job.height || preset.height;
+  const refParams = {};
+  if (refs && refs.length) {
+    refParams.reference_image_multiple = refs.map(r => r.base64);
+    refParams.reference_strength_multiple = refs.map(r => Number(r.strength ?? 0.6));
+    refParams.reference_information_extracted_multiple = refs.map(r => Number(r.fidelity ?? 1.0));
+  }
   return {
     input: job.finalPrompt,
     model: preset.model,
@@ -393,6 +417,7 @@ function buildPayload({ job, preset, seed }) {
       params_version: 3,
       width,
       height,
+      ...refParams,
       scale: preset.cfgScale,
       sampler: preset.sampler,
       steps: preset.steps,
@@ -492,7 +517,7 @@ async function findUnusedFilename(dir, baseName) {
   }
 }
 
-async function saveJobResult({ rootDir, session, job, preset, seed, imageBlob }) {
+async function saveJobResult({ rootDir, session, job, preset, seed, imageBlob, refs }) {
   const width = job.width || preset.width;
   const height = job.height || preset.height;
   const sessionDirName = `${session.startedAt.replace(/[:T]/g,'-').replace(/\..+$/,'')}_${sanitizeFs(session.name)}`;
@@ -520,6 +545,8 @@ async function saveJobResult({ rootDir, session, job, preset, seed, imageBlob })
     smea: preset.smea,
     smeaDyn: preset.smeaDyn,
     seed,
+    referenceCount: refs?.length || 0,
+    references: (refs || []).map(r => ({ strength: r.strength, fidelity: r.fidelity, mode: r.mode })),
     createdAt: nowIso(),
   };
   await writeFile(charDir, jsonName, new Blob([JSON.stringify(meta, null, 2)], { type: 'application/json' }));
@@ -555,6 +582,21 @@ async function startRun({ session, jobs, preset, settings, rootDir }) {
   // restore per-character seeds from already-running session if reload
   const characters = await db.getAll('characters');
   const charById = new Map(characters.map(c => [c.id, c]));
+  // PR reference cache: characterId → encoded refs array
+  const refCache = new Map();
+  async function getRefsFor(character) {
+    if (refCache.has(character.id)) return refCache.get(character.id);
+    const raw = (character.referenceImages || []).filter(r => r.enabled !== false && r.blob);
+    if (!raw.length) { refCache.set(character.id, []); return []; }
+    const encoded = await Promise.all(raw.map(async (r) => ({
+      base64: await blobToBase64(r.blob),
+      strength: Number.isFinite(r.strength) ? r.strength : 0.6,
+      fidelity: Number.isFinite(r.fidelity) ? r.fidelity : 1.0,
+      mode: r.mode || 'character',
+    })));
+    refCache.set(character.id, encoded);
+    return encoded;
+  }
 
   // mark all jobs queued
   for (let i = 0; i < jobs.length; i++) {
@@ -585,9 +627,11 @@ async function startRun({ session, jobs, preset, settings, rootDir }) {
     rlog('info', `#${pad(job.order)} ${job.characterName} / ${job.promptTitle} 시작 (seed=${seed})`);
 
     try {
-      const payload = buildPayload({ job, preset, seed });
+      const refs = await getRefsFor(character);
+      const payload = buildPayload({ job, preset, seed, refs });
+      if (refs.length) rlog('info', `#${pad(job.order)} PR refs ${refs.length}장 적용 (strength avg ${(refs.reduce((a,b)=>a+b.strength,0)/refs.length).toFixed(2)})`);
       const blob = await novelaiGenerate(settings.apiBase, settings.apiToken, payload);
-      const saved = await saveJobResult({ rootDir, session, job, preset, seed, imageBlob: blob });
+      const saved = await saveJobResult({ rootDir, session, job, preset, seed, imageBlob: blob, refs });
       job = { ...job, status: 'success', completedAt: nowIso(), outputPath: `${saved.sessionDirName}/${sanitizeFs(job.characterName)}/${saved.pngName}`, metadataPath: saved.jsonName, errorMessage: undefined };
       jobs[i] = job;
       await db.put('jobs', job);
@@ -779,7 +823,10 @@ function CharactersPage({ characters, reload }) {
           <div key={c.id} className="card p-4 space-y-2">
             <div className="flex items-start justify-between">
               <div>
-                <div className="font-semibold">{c.name}</div>
+                <div className="font-semibold flex items-center gap-2">
+                  <span>{c.name}</span>
+                  {(c.referenceImages?.filter(r=>r.enabled!==false).length || 0) > 0 && <span className="badge badge-running">PR {c.referenceImages.filter(r=>r.enabled!==false).length}</span>}
+                </div>
                 <div className="text-xs text-slate-400">seed: {c.defaultSeedMode}{c.fixedSeed!=null?` · ${c.fixedSeed}`:''}</div>
               </div>
               <div className="flex gap-1">
@@ -801,7 +848,7 @@ function CharactersPage({ characters, reload }) {
 
 function CharacterEditor({ initial, onCancel, onSave }) {
   const [draft, setDraft] = useState(initial || {
-    name: '', basePrompt: '', negativePrompt: '', defaultSeedMode: 'random', fixedSeed: '', outputFolderName: '', tags: []
+    name: '', basePrompt: '', negativePrompt: '', defaultSeedMode: 'random', fixedSeed: '', outputFolderName: '', tags: [], referenceImages: []
   });
   const upd = (patch) => setDraft(d => ({ ...d, ...patch }));
   const valid = draft.name.trim().length > 0;
@@ -810,8 +857,31 @@ function CharacterEditor({ initial, onCancel, onSave }) {
     const out = { ...draft };
     out.fixedSeed = out.fixedSeed === '' || out.fixedSeed == null ? undefined : Number(out.fixedSeed);
     out.outputFolderName = (out.outputFolderName || out.name).trim();
+    out.referenceImages = (out.referenceImages || []).map(r => ({ ...r }));
     onSave(out);
   };
+
+  const refs = draft.referenceImages || [];
+  const addRefs = async () => {
+    const files = await pickImageFiles(true);
+    if (!files.length) return;
+    const max = 6;
+    const remaining = max - refs.length;
+    if (remaining <= 0) { alert(`PR 이미지는 최대 ${max}장까지 추가할 수 있습니다.`); return; }
+    const picked = files.slice(0, remaining).map(f => ({
+      id: uid('ref'),
+      blob: f,
+      mimeType: f.type || 'image/png',
+      filename: f.name,
+      enabled: true,
+      mode: 'character',
+      strength: 0.6,
+      fidelity: 1.0,
+    }));
+    setDraft(d => ({ ...d, referenceImages: [...(d.referenceImages||[]), ...picked] }));
+  };
+  const updRef = (id, patch) => setDraft(d => ({ ...d, referenceImages: (d.referenceImages||[]).map(r => r.id===id ? { ...r, ...patch } : r) }));
+  const rmRef = (id) => setDraft(d => ({ ...d, referenceImages: (d.referenceImages||[]).filter(r => r.id !== id) }));
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onCancel}>
       <div className="card p-5 w-full max-w-2xl space-y-3 max-h-[90vh] overflow-auto" onClick={e=>e.stopPropagation()}>
@@ -830,9 +900,62 @@ function CharacterEditor({ initial, onCancel, onSave }) {
           </Field>
           <Field label="고정 seed (선택)"><input className="input mono" value={draft.fixedSeed??''} onChange={e=>upd({fixedSeed:e.target.value})} placeholder="비우면 자동" /></Field>
         </div>
+
+        <div className="space-y-2 pt-2 border-t border-slate-800/60 mt-2">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-sm font-medium">Precise Reference (PR) 이미지</div>
+              <div className="text-xs text-slate-500">캐릭터 단위로 묶인 레퍼런스. 큐 실행 시 이 캐릭터의 모든 작업에 자동 적용됩니다 (최대 6장).</div>
+            </div>
+            <button className="btn" onClick={addRefs}>+ 이미지 추가</button>
+          </div>
+          {refs.length === 0 && <div className="text-xs text-slate-500 py-2">아직 레퍼런스 이미지가 없습니다.</div>}
+          <div className="space-y-2">
+            {refs.map(r => <RefImageRow key={r.id} r={r} onUpdate={(p)=>updRef(r.id,p)} onRemove={()=>rmRef(r.id)} />)}
+          </div>
+        </div>
+
         <div className="flex justify-end gap-2 pt-2">
           <button className="btn" onClick={onCancel}>취소</button>
           <button className="btn btn-primary" onClick={submit} disabled={!valid}>저장</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RefImageRow({ r, onUpdate, onRemove }) {
+  const url = useMemo(() => r.blob ? URL.createObjectURL(r.blob) : '', [r.blob]);
+  useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
+  return (
+    <div className="card p-3 flex gap-3 items-start">
+      {url ? <img src={url} alt={r.filename} className="w-24 h-24 object-cover rounded-lg border border-slate-700" /> : <div className="w-24 h-24 bg-slate-800 rounded-lg" />}
+      <div className="flex-1 space-y-2 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-xs flex items-center gap-1 cursor-pointer select-none">
+            <input type="checkbox" checked={r.enabled !== false} onChange={e=>onUpdate({enabled:e.target.checked})} />
+            Enabled
+          </label>
+          <select className="input py-1 text-xs" style={{ width:'auto', minWidth:'120px' }} value={r.mode||'character'} onChange={e=>onUpdate({mode:e.target.value})}>
+            <option value="character">Character</option>
+            <option value="style">Style</option>
+          </select>
+          <span className="text-xs text-slate-500 truncate flex-1" title={r.filename}>{r.filename}</span>
+          <button className="btn btn-ghost text-red-400 text-xs" onClick={onRemove}>삭제</button>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <div className="flex items-center justify-between text-xs text-slate-300">
+              <span>Strength</span><span className="mono">{Number(r.strength??0.6).toFixed(2)}</span>
+            </div>
+            <input type="range" min="0" max="1" step="0.05" value={r.strength??0.6} onChange={e=>onUpdate({strength:Number(e.target.value)})} className="w-full" />
+          </div>
+          <div>
+            <div className="flex items-center justify-between text-xs text-slate-300">
+              <span>Fidelity</span><span className="mono">{Number(r.fidelity??1.0).toFixed(2)}</span>
+            </div>
+            <input type="range" min="0" max="1" step="0.05" value={r.fidelity??1.0} onChange={e=>onUpdate({fidelity:Number(e.target.value)})} className="w-full" />
+          </div>
         </div>
       </div>
     </div>
@@ -1234,6 +1357,7 @@ function BatchRunPage({ characters, promptSets, settings }) {
               <label key={c.id} className={`flex items-center gap-2 p-2 rounded-lg cursor-pointer ${selectedChars.includes(c.id)?'bg-blue-900/30':'hover:bg-slate-800/40'}`}>
                 <input type="checkbox" checked={selectedChars.includes(c.id)} onChange={()=>toggleChar(c.id)} />
                 <span className="flex-1 truncate">{c.name}</span>
+                {(c.referenceImages?.filter(r=>r.enabled!==false).length || 0) > 0 && <span className="badge badge-running">PR {c.referenceImages.filter(r=>r.enabled!==false).length}</span>}
                 <span className="text-xs text-slate-500 mono truncate max-w-[40%]">{c.basePrompt?.slice(0,60)}</span>
               </label>
             ))}

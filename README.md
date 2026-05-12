@@ -30,6 +30,18 @@ python -m http.server 5173
 4. **배치 실행** 페이지에서 캐릭터들 + 세트 선택 → 프리셋 설정 → `큐 생성` → `실행`
 5. 결과는 `출력폴더/{날짜_세션명}/{캐릭터명}/{슬롯제목_seed}.png` 형식으로 저장
 
+## Precise Reference (PR / 캐릭터 자동 스위칭)
+
+캐릭터 프로필마다 최대 6장의 레퍼런스 이미지를 등록할 수 있다. 배치 실행 시 각 캐릭터의 활성 레퍼런스가 그 캐릭터의 모든 작업에 자동으로 적용되고, 캐릭터가 전환되면 레퍼런스도 자동으로 교체된다.
+
+- **추가**: 캐릭터 편집 모달 → `+ 이미지 추가` → 1장 이상 선택
+- **항목별 컨트롤**: `Enabled` 체크, `Character / Style` 모드, `Strength` (0–1), `Fidelity` (0–1)
+- **표시**: 캐릭터 카드 / 배치 실행 선택 목록에 `PR N` 배지로 활성 개수 표시
+- **저장**: 이미지 파일은 IndexedDB에 Blob 그대로 보관, NovelAI 호출 시점에 base64로 인코딩되어 `reference_image_multiple`, `reference_strength_multiple`, `reference_information_extracted_multiple` 파라미터에 주입
+- **로그**: 큐 실행 중 `#003 PR refs 2장 적용 (strength avg 0.60)` 같은 라인이 남고, 저장되는 metadata.json 에도 `referenceCount` / `references[]` 가 기록됨
+
+> NovelAI API의 정확한 reference 파라미터 이름/포맷은 모델 버전에 따라 다를 수 있다. v4 계열에서 동작이 다르면 `buildPayload` 의 `refParams` 부분을 조정.
+
 ## 배치 공통 Prompt / Undesired Content
 
 배치 실행 페이지의 **배치 공통 Prompt / Undesired Content** 카드는 NovelAI 본가 UI의 "Prompt" + "Undesired Content" 입력란과 같은 동작을 한다.
