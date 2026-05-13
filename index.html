@@ -1315,6 +1315,31 @@ function BatchRunPage({ characters, promptSets, settings }) {
     startRun({ session, jobs: fresh, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
   };
 
+  const retrySelected = async (jobIds) => {
+    setError('');
+    const sessionId = sessionObj?.id || runner.get().sessionId;
+    if (!sessionId || !jobIds?.length) return;
+    const idSet = new Set(jobIds);
+    const all = await db.jobsBySession(sessionId);
+    for (const j of all) {
+      if (idSet.has(j.id)) {
+        await db.put('jobs', {
+          ...j,
+          status: 'pending',
+          retryCount: 0,
+          errorMessage: undefined,
+          completedAt: undefined,
+          startedAt: undefined,
+          seed: randSeed(),
+        });
+      }
+    }
+    rlog('info', `${jobIds.length}개 잡 재생성 예약 (새 seed)`);
+    const session = sessionObj || await db.get('sessions', sessionId);
+    const fresh = (await db.jobsBySession(sessionId)).sort((a,b)=>a.order-b.order);
+    startRun({ session, jobs: fresh, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
+  };
+
   const progress = useMemo(() => {
     const total = queue.length;
     const done = queue.filter(j => ['success','failed','skipped','cancelled'].includes(j.status)).length;
@@ -1400,7 +1425,7 @@ function BatchRunPage({ characters, promptSets, settings }) {
         <div className="w-full bg-slate-800/60 rounded-full h-2 overflow-hidden">
           <div className="bg-blue-500 h-2 transition-all" style={{ width: `${progress.pct}%` }} />
         </div>
-        <QueueTable jobs={queue} />
+        <QueueTable jobs={queue} allowRetry onRetrySelected={retrySelected} />
       </div>
 
       <RunnerLogs />
@@ -1436,30 +1461,69 @@ function JobImage({ jobId, size = 64 }) {
   );
 }
 
-function QueueTable({ jobs }) {
+function QueueTable({ jobs, allowRetry, onRetrySelected }) {
+  const [selected, setSelected] = useState(() => new Set());
+  const r = useStore(runner);
   if (!jobs.length) return <div className="text-slate-500 text-sm">큐가 비었습니다. “큐 생성”을 누르세요.</div>;
+
+  const toggle = (id) => setSelected(prev => {
+    const ns = new Set(prev);
+    if (ns.has(id)) ns.delete(id); else ns.add(id);
+    return ns;
+  });
+  const allSelected = jobs.length > 0 && selected.size === jobs.length;
+  const toggleAll = () => setSelected(allSelected ? new Set() : new Set(jobs.map(j => j.id)));
+  const canRetry = allowRetry && !r.isRunning && selected.size > 0;
+  const doRetry = () => {
+    if (!canRetry) return;
+    const ids = Array.from(selected);
+    setSelected(new Set());
+    onRetrySelected(ids);
+  };
+
   return (
-    <div className="overflow-auto max-h-[600px]">
-      <table className="w-full text-sm">
-        <thead className="text-xs text-slate-400 sticky top-0 bg-[#131826]">
-          <tr><th className="text-left p-2">#</th><th className="text-left p-2">미리보기</th><th className="text-left p-2">캐릭터</th><th className="text-left p-2">프롬프트</th><th className="text-left p-2">상태</th><th className="text-left p-2">seed</th><th className="text-left p-2">재시도</th><th className="text-left p-2">저장</th><th className="text-left p-2">오류</th></tr>
-        </thead>
-        <tbody>
-          {jobs.map(j => (
-            <tr key={j.id} className="row-hover border-t border-slate-800/60">
-              <td className="p-2 mono align-middle">{pad(j.order)}</td>
-              <td className="p-2 align-middle">{j.status === 'success' ? <JobImage jobId={j.id} /> : <div className="w-16 h-16 rounded border border-dashed border-slate-700" />}</td>
-              <td className="p-2 align-middle">{j.characterName}</td>
-              <td className="p-2 truncate max-w-[200px] align-middle">{j.promptTitle}</td>
-              <td className="p-2 align-middle"><Badge status={j.status} /></td>
-              <td className="p-2 mono text-xs align-middle">{j.seed ?? '-'}</td>
-              <td className="p-2 mono text-xs align-middle">{j.retryCount || 0}</td>
-              <td className="p-2 align-middle">{j.status === 'success' ? <button className="btn btn-ghost text-xs" onClick={()=>downloadJobImage(j)}>저장</button> : null}</td>
-              <td className="p-2 text-xs truncate max-w-[280px] align-middle" title={j.errorMessage}>{j.errorMessage ? <span className="text-red-400">{j.errorMessage}</span> : ''}</td>
+    <div className="space-y-2">
+      {allowRetry && (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-slate-400">선택: <span className="mono text-slate-200">{selected.size}</span></span>
+          {selected.size > 0 && <button className="btn btn-ghost" onClick={()=>setSelected(new Set())}>해제</button>}
+          <button className="btn btn-primary ml-auto" disabled={!canRetry} onClick={doRetry}>선택한 항목 재생성</button>
+        </div>
+      )}
+      <div className="overflow-auto max-h-[600px]">
+        <table className="w-full text-sm">
+          <thead className="text-xs text-slate-400 sticky top-0 bg-[#131826]">
+            <tr>
+              {allowRetry && <th className="text-left p-2"><input type="checkbox" checked={allSelected} onChange={toggleAll} title="전체 선택 / 해제" /></th>}
+              <th className="text-left p-2">#</th>
+              <th className="text-left p-2">미리보기</th>
+              <th className="text-left p-2">캐릭터</th>
+              <th className="text-left p-2">프롬프트</th>
+              <th className="text-left p-2">상태</th>
+              <th className="text-left p-2">seed</th>
+              <th className="text-left p-2">재시도</th>
+              <th className="text-left p-2">저장</th>
+              <th className="text-left p-2">오류</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {jobs.map(j => (
+              <tr key={j.id} className={`row-hover border-t border-slate-800/60 ${selected.has(j.id) ? 'bg-blue-900/20' : ''}`}>
+                {allowRetry && <td className="p-2 align-middle"><input type="checkbox" checked={selected.has(j.id)} onChange={()=>toggle(j.id)} /></td>}
+                <td className="p-2 mono align-middle">{pad(j.order)}</td>
+                <td className="p-2 align-middle">{j.status === 'success' ? <JobImage jobId={j.id} /> : <div className="w-16 h-16 rounded border border-dashed border-slate-700" />}</td>
+                <td className="p-2 align-middle">{j.characterName}</td>
+                <td className="p-2 truncate max-w-[200px] align-middle">{j.promptTitle}</td>
+                <td className="p-2 align-middle"><Badge status={j.status} /></td>
+                <td className="p-2 mono text-xs align-middle">{j.seed ?? '-'}</td>
+                <td className="p-2 mono text-xs align-middle">{j.retryCount || 0}</td>
+                <td className="p-2 align-middle">{j.status === 'success' ? <button className="btn btn-ghost text-xs" onClick={()=>downloadJobImage(j)}>저장</button> : null}</td>
+                <td className="p-2 text-xs truncate max-w-[280px] align-middle" title={j.errorMessage}>{j.errorMessage ? <span className="text-red-400">{j.errorMessage}</span> : ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -1481,10 +1545,11 @@ function RunnerLogs() {
   );
 }
 
-function SessionsPage({ characters, promptSets }) {
+function SessionsPage({ characters, promptSets, settings }) {
   const [sessions, setSessions] = useState([]);
   const [openId, setOpenId] = useState(null);
   const [jobs, setJobs] = useState([]);
+  const r = useStore(runner);
 
   const reload = async () => {
     const ss = await db.getAll('sessions');
@@ -1496,6 +1561,15 @@ function SessionsPage({ characters, promptSets }) {
     db.jobsBySession(openId).then(js => setJobs(js.sort((a,b)=>a.order-b.order)));
   }, [openId]);
 
+  // Refresh jobs while runner is processing the opened session
+  useEffect(() => {
+    if (!openId || !r.isRunning || r.sessionId !== openId) return;
+    const t = setInterval(() => {
+      db.jobsBySession(openId).then(js => setJobs(js.sort((a,b)=>a.order-b.order)));
+    }, 1500);
+    return () => clearInterval(t);
+  }, [openId, r.isRunning, r.sessionId]);
+
   const del = async (id) => {
     await db.delete('sessions', id);
     const jobs = await db.jobsBySession(id);
@@ -1503,6 +1577,30 @@ function SessionsPage({ characters, promptSets }) {
     await deleteImagesBySession(id);
     if (openId === id) setOpenId(null);
     reload();
+  };
+
+  const retrySelected = async (jobIds) => {
+    if (!openId || !jobIds?.length || r.isRunning) return;
+    const idSet = new Set(jobIds);
+    const all = await db.jobsBySession(openId);
+    for (const j of all) {
+      if (idSet.has(j.id)) {
+        await db.put('jobs', {
+          ...j,
+          status: 'pending',
+          retryCount: 0,
+          errorMessage: undefined,
+          completedAt: undefined,
+          startedAt: undefined,
+          seed: randSeed(),
+        });
+      }
+    }
+    rlog('info', `${jobIds.length}개 잡 재생성 예약 (새 seed)`);
+    const session = await db.get('sessions', openId);
+    const fresh = (await db.jobsBySession(openId)).sort((a,b)=>a.order-b.order);
+    setJobs(fresh);
+    startRun({ session, jobs: fresh, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
   };
 
   return (
@@ -1520,7 +1618,7 @@ function SessionsPage({ characters, promptSets }) {
               <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={()=>del(s.id)}>삭제</ConfirmButton>
             </div>
             {openId === s.id && (
-              <div className="mt-3"><QueueTable jobs={jobs} /></div>
+              <div className="mt-3"><QueueTable jobs={jobs} allowRetry onRetrySelected={retrySelected} /></div>
             )}
           </div>
         ))}
@@ -1677,7 +1775,7 @@ function App() {
         {page === 'characters' && <CharactersPage characters={characters} reload={reloadChars} />}
         {page === 'prompts' && <PromptSetsPage promptSets={promptSets} reload={reloadSets} />}
         {page === 'batch' && <BatchRunPage characters={characters} promptSets={promptSets} settings={settings} />}
-        {page === 'sessions' && <SessionsPage characters={characters} promptSets={promptSets} />}
+        {page === 'sessions' && <SessionsPage characters={characters} promptSets={promptSets} settings={settings} />}
         {page === 'settings' && <SettingsPage settings={settings} setSettings={setSettings} />}
       </main>
     </div>
