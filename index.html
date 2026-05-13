@@ -110,8 +110,8 @@ async function blobToBase64(blob) {
 
 /* ============ IndexedDB ============ */
 const DB_NAME = 'nai-batch-runner';
-const DB_VERSION = 1;
-const STORES = ['characters', 'promptSets', 'sessions', 'jobs', 'kv'];
+const DB_VERSION = 2;
+const STORES = ['characters', 'promptSets', 'sessions', 'jobs', 'kv', 'images'];
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -121,7 +121,7 @@ function openDB() {
       STORES.forEach(name => {
         if (!db.objectStoreNames.contains(name)) {
           const s = db.createObjectStore(name, { keyPath: name === 'kv' ? 'key' : 'id' });
-          if (name === 'jobs') s.createIndex('sessionId', 'sessionId', { unique: false });
+          if (name === 'jobs' || name === 'images') s.createIndex('sessionId', 'sessionId', { unique: false });
         }
       });
     };
@@ -186,11 +186,17 @@ const DEFAULT_SETTINGS = {
   maxRetry: 2,
   apiBase: 'https://image.novelai.net',
 };
+function isProxyMode() {
+  return /^https?:\/\/(localhost|127\.|\[::1\])/.test(window.location.origin);
+}
 function loadSettings() {
+  let s;
   try {
     const raw = localStorage.getItem('nai-settings');
-    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_SETTINGS };
-  } catch { return { ...DEFAULT_SETTINGS }; }
+    s = raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_SETTINGS };
+  } catch { s = { ...DEFAULT_SETTINGS }; }
+  if (isProxyMode()) s.apiBase = window.location.origin;
+  return s;
 }
 function saveSettings(s) {
   localStorage.setItem('nai-settings', JSON.stringify(s));
@@ -324,6 +330,7 @@ const runner = createStore({
   sessionId: null,
   current: null, // { jobId, characterName, promptTitle, index, total }
   logs: [],      // { ts, level, msg }
+  anlas: { balance: null, sessionStart: null }, // balance: 현재 잔량, sessionStart: 세션 시작 시 잔량
 });
 function rlog(level, msg) {
   runner.set(s => ({ ...s, logs: [...s.logs.slice(-499), { ts: nowIso(), level, msg }] }));
@@ -403,39 +410,62 @@ function buildQueue({ characters, promptSet, sessionId, batch, preset }) {
 function buildPayload({ job, preset, seed, refs }) {
   const width = job.width || preset.width;
   const height = job.height || preset.height;
+  const isV4 = /^nai-diffusion-4/.test(preset.model);
+
   const refParams = {};
   if (refs && refs.length) {
     refParams.reference_image_multiple = refs.map(r => r.base64);
     refParams.reference_strength_multiple = refs.map(r => Number(r.strength ?? 0.6));
     refParams.reference_information_extracted_multiple = refs.map(r => Number(r.fidelity ?? 1.0));
   }
+
+  const params = {
+    params_version: 3,
+    width,
+    height,
+    ...refParams,
+    scale: preset.cfgScale,
+    sampler: preset.sampler,
+    steps: preset.steps,
+    n_samples: 1,
+    ucPreset: 0,
+    qualityToggle: true,
+    dynamic_thresholding: false,
+    controlnet_strength: 1,
+    legacy: false,
+    add_original_image: false,
+    uncond_scale: 1,
+    cfg_rescale: 0,
+    noise_schedule: 'karras',
+    negative_prompt: job.finalNegativePrompt,
+    seed,
+  };
+
+  if (isV4) {
+    params.v4_prompt = {
+      caption: { base_caption: job.finalPrompt, char_captions: [] },
+      use_coords: false,
+      use_order: true,
+    };
+    params.v4_negative_prompt = {
+      caption: { base_caption: job.finalNegativePrompt, char_captions: [] },
+      legacy_uc: false,
+    };
+    params.characterPrompts = [];
+    params.use_coords = false;
+    params.legacy_v3_extend = false;
+    params.skip_cfg_above_sigma = null;
+    params.autoSmea = !!preset.smea;
+  } else {
+    params.sm = !!preset.smea;
+    params.sm_dyn = !!preset.smeaDyn;
+  }
+
   return {
     input: job.finalPrompt,
     model: preset.model,
     action: 'generate',
-    parameters: {
-      params_version: 3,
-      width,
-      height,
-      ...refParams,
-      scale: preset.cfgScale,
-      sampler: preset.sampler,
-      steps: preset.steps,
-      n_samples: 1,
-      ucPreset: 0,
-      qualityToggle: true,
-      sm: !!preset.smea,
-      sm_dyn: !!preset.smeaDyn,
-      dynamic_thresholding: false,
-      controlnet_strength: 1,
-      legacy: false,
-      add_original_image: false,
-      uncond_scale: 1,
-      cfg_rescale: 0,
-      noise_schedule: 'karras',
-      negative_prompt: job.finalNegativePrompt,
-      seed,
-    },
+    parameters: params,
   };
 }
 
@@ -443,7 +473,26 @@ async function novelaiValidateToken(apiBase, token) {
   // GET /user/information
   const url = `${apiBase.replace(/\/$/,'')}/user/information`.replace('image.novelai.net','api.novelai.net');
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  return res.ok;
+  if (res.ok) return { ok: true };
+  let body = '';
+  try { body = (await res.text()).slice(0, 200); } catch {}
+  return { ok: false, status: res.status, body };
+}
+
+async function novelaiGetSubscription(apiBase, token) {
+  // GET /user/subscription → Anlas 잔량
+  const url = `${apiBase.replace(/\/$/,'')}/user/subscription`.replace('image.novelai.net','api.novelai.net');
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch {}
+    throw new Error(`subscription ${res.status}: ${body.slice(0,200)}`);
+  }
+  const j = await res.json();
+  const left = j.trainingStepsLeft || {};
+  const fixed = Number(left.fixedTrainingStepsLeft) || 0;
+  const paid = Number(left.purchasedTrainingSteps) || 0;
+  return { fixed, paid, total: fixed + paid };
 }
 
 async function novelaiGenerate(apiBase, token, payload, signal) {
@@ -473,129 +522,51 @@ async function novelaiGenerate(apiBase, token, payload, signal) {
   return new Blob([blob], { type: 'image/png' });
 }
 
-/* ============ File System Access Saver ============ */
-async function pickOutputDir() {
-  if (!window.showDirectoryPicker) throw new Error('이 브라우저는 폴더 저장 API를 지원하지 않습니다. Chrome 또는 Edge 최신 버전을 사용하세요.');
-  const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
-  await kvSet('outputDirHandle', handle);
-  return handle;
+/* ============ Image storage (IndexedDB) ============ */
+async function saveImageBlob({ sessionId, job, blob }) {
+  await db.put('images', { id: job.id, sessionId, blob, createdAt: nowIso() });
 }
-async function getStoredOutputDir() {
-  const handle = await kvGet('outputDirHandle', null);
-  if (!handle) return null;
-  try {
-    const perm = await handle.queryPermission({ mode: 'readwrite' });
-    if (perm === 'granted') return handle;
-    const req = await handle.requestPermission({ mode: 'readwrite' });
-    return req === 'granted' ? handle : null;
-  } catch { return null; }
+async function getImageBlob(jobId) {
+  const rec = await db.get('images', jobId);
+  return rec?.blob || null;
 }
-async function ensureDir(parent, name) {
-  return parent.getDirectoryHandle(sanitizeFs(name), { create: true });
-}
-async function writeFile(dir, name, data) {
-  const fh = await dir.getFileHandle(name, { create: true });
-  const w = await fh.createWritable();
-  await w.write(data);
-  await w.close();
-}
-async function findUnusedFilename(dir, baseName) {
-  let candidate = baseName;
-  let i = 2;
-  // try existence by attempting open; FileSystemDirectoryHandle has no list helper here
-  while (true) {
-    try {
-      await dir.getFileHandle(candidate, { create: false });
-      const dot = baseName.lastIndexOf('.');
-      const stem = dot > 0 ? baseName.slice(0, dot) : baseName;
-      const ext = dot > 0 ? baseName.slice(dot) : '';
-      candidate = `${stem}_v${i}${ext}`;
-      i += 1;
-    } catch {
-      return candidate;
-    }
-  }
+async function deleteImagesBySession(sessionId) {
+  const all = await db.getAll('images');
+  for (const r of all) if (r.sessionId === sessionId) await db.delete('images', r.id);
 }
 
-async function saveJobResult({ rootDir, session, job, preset, seed, imageBlob, refs }) {
-  const width = job.width || preset.width;
-  const height = job.height || preset.height;
-  const sessionDirName = `${session.startedAt.replace(/[:T]/g,'-').replace(/\..+$/,'')}_${sanitizeFs(session.name)}`;
-  const sessionDir = await ensureDir(rootDir, sessionDirName);
-  const charDir = await ensureDir(sessionDir, job.characterName);
-  const titleSafe = sanitizeFs(job.promptTitle);
-  const baseName = `${titleSafe}_${seed}`;
-  const pngName = await findUnusedFilename(charDir, `${baseName}.png`);
-  const jsonName = pngName.replace(/\.png$/i, '.json');
-  await writeFile(charDir, pngName, imageBlob);
-  const meta = {
-    sessionId: session.id,
-    jobId: job.id,
-    order: job.order,
-    characterName: job.characterName,
-    promptTitle: job.promptTitle,
-    finalPrompt: job.finalPrompt,
-    finalNegativePrompt: job.finalNegativePrompt,
-    model: preset.model,
-    width,
-    height,
-    steps: preset.steps,
-    cfgScale: preset.cfgScale,
-    sampler: preset.sampler,
-    smea: preset.smea,
-    smeaDyn: preset.smeaDyn,
-    seed,
-    referenceCount: refs?.length || 0,
-    references: (refs || []).map(r => ({ strength: r.strength, fidelity: r.fidelity, mode: r.mode })),
-    createdAt: nowIso(),
-  };
-  await writeFile(charDir, jsonName, new Blob([JSON.stringify(meta, null, 2)], { type: 'application/json' }));
-  return { pngName, jsonName, sessionDirName };
-}
-
-async function saveSessionManifest(rootDir, session, jobs) {
-  const sessionDirName = `${session.startedAt.replace(/[:T]/g,'-').replace(/\..+$/,'')}_${sanitizeFs(session.name)}`;
-  const sessionDir = await ensureDir(rootDir, sessionDirName);
-  const manifest = {
-    id: session.id,
-    name: session.name,
-    startedAt: session.startedAt,
-    completedAt: session.completedAt || null,
-    preset: session.preset,
-    characterIds: session.characterIds,
-    promptSetId: session.promptSetId,
-    total: jobs.length,
-    success: jobs.filter(j => j.status==='success').length,
-    failed: jobs.filter(j => j.status==='failed').length,
-    skipped: jobs.filter(j => j.status==='skipped').length,
-    cancelled: jobs.filter(j => j.status==='cancelled').length,
-  };
-  await writeFile(sessionDir, 'session.json', new Blob([JSON.stringify(manifest, null, 2)], { type: 'application/json' }));
-}
 
 /* ============ Runner ============ */
-async function startRun({ session, jobs, preset, settings, rootDir }) {
-  runner.set({ isRunning: true, isPaused: false, isCancelling: false, sessionId: session.id, current: null, logs: [] });
+async function startRun({ session, jobs, preset, settings }) {
+  runner.set({ isRunning: true, isPaused: false, isCancelling: false, sessionId: session.id, current: null, logs: [], anlas: { balance: null, sessionStart: null } });
   rlog('info', `세션 시작: ${session.name} (jobs=${jobs.length})`);
+
+  try {
+    const a = await novelaiGetSubscription(settings.apiBase, settings.apiToken);
+    runner.set(s => ({ ...s, anlas: { balance: a.total, sessionStart: a.total } }));
+    rlog('info', `Anlas 시작 잔량: ${a.total.toLocaleString()}`);
+  } catch (e) {
+    rlog('warn', `Anlas 조회 실패: ${e.message||e}`);
+  }
 
   const perCharSeed = new Map();
   // restore per-character seeds from already-running session if reload
   const characters = await db.getAll('characters');
   const charById = new Map(characters.map(c => [c.id, c]));
-  // PR reference cache: characterId → encoded refs array
+  // PR reference cache: characterId → refs array (raw base64, no encoding)
   const refCache = new Map();
   async function getRefsFor(character) {
     if (refCache.has(character.id)) return refCache.get(character.id);
     const raw = (character.referenceImages || []).filter(r => r.enabled !== false && r.blob);
     if (!raw.length) { refCache.set(character.id, []); return []; }
-    const encoded = await Promise.all(raw.map(async (r) => ({
+    const out = await Promise.all(raw.map(async (r) => ({
       base64: await blobToBase64(r.blob),
       strength: Number.isFinite(r.strength) ? r.strength : 0.6,
       fidelity: Number.isFinite(r.fidelity) ? r.fidelity : 1.0,
       mode: r.mode || 'character',
     })));
-    refCache.set(character.id, encoded);
-    return encoded;
+    refCache.set(character.id, out);
+    return out;
   }
 
   // mark all jobs queued
@@ -631,11 +602,14 @@ async function startRun({ session, jobs, preset, settings, rootDir }) {
       const payload = buildPayload({ job, preset, seed, refs });
       if (refs.length) rlog('info', `#${pad(job.order)} PR refs ${refs.length}장 적용 (strength avg ${(refs.reduce((a,b)=>a+b.strength,0)/refs.length).toFixed(2)})`);
       const blob = await novelaiGenerate(settings.apiBase, settings.apiToken, payload);
-      const saved = await saveJobResult({ rootDir, session, job, preset, seed, imageBlob: blob, refs });
-      job = { ...job, status: 'success', completedAt: nowIso(), outputPath: `${saved.sessionDirName}/${sanitizeFs(job.characterName)}/${saved.pngName}`, metadataPath: saved.jsonName, errorMessage: undefined };
+      await saveImageBlob({ sessionId: session.id, job, blob });
+      job = { ...job, status: 'success', completedAt: nowIso(), errorMessage: undefined };
       jobs[i] = job;
       await db.put('jobs', job);
-      rlog('info', `#${pad(job.order)} success → ${saved.pngName}`);
+      rlog('info', `#${pad(job.order)} success`);
+      novelaiGetSubscription(settings.apiBase, settings.apiToken)
+        .then(a => runner.set(s => ({ ...s, anlas: { ...s.anlas, balance: a.total } })))
+        .catch(()=>{});
     } catch (err) {
       const isAuth = err.status === 401 || err.status === 403;
       if (isAuth) {
@@ -678,7 +652,6 @@ async function startRun({ session, jobs, preset, settings, rootDir }) {
 
   session.completedAt = nowIso();
   await db.put('sessions', session);
-  try { await saveSessionManifest(rootDir, session, jobs); } catch (e) { rlog('warn', `세션 매니페스트 저장 실패: ${e.message||e}`); }
 
   runner.set({ isRunning: false, isPaused: false, isCancelling: false, sessionId: session.id, current: null, logs: runner.get().logs });
   rlog('info', `세션 종료: ${session.name}`);
@@ -719,30 +692,16 @@ function SettingsPage({ settings, setSettings }) {
   const [reveal, setReveal] = useState(false);
   const [validating, setValidating] = useState(false);
   const [validMsg, setValidMsg] = useState('');
-  const [dirName, setDirName] = useState('(미선택)');
   const [delay, setDelay] = useState(settings.delayBetweenJobsMs);
   const [maxRetry, setMaxRetry] = useState(settings.maxRetry);
   const [apiBase, setApiBase] = useState(settings.apiBase);
 
-  useEffect(() => {
-    (async () => {
-      const h = await kvGet('outputDirHandle', null);
-      if (h?.name) setDirName(h.name);
-    })();
-  }, []);
-
-  const pick = async () => {
-    try {
-      const h = await pickOutputDir();
-      setDirName(h.name);
-    } catch (e) { alert(e.message || e); }
-  };
-
   const validate = async () => {
     setValidating(true); setValidMsg('');
     try {
-      const ok = await novelaiValidateToken(apiBase, token);
-      setValidMsg(ok ? '✓ 토큰 유효' : '✗ 검증 실패');
+      const r = await novelaiValidateToken(apiBase, token);
+      if (r.ok) setValidMsg('✓ 토큰 유효');
+      else setValidMsg(`✗ ${r.status} ${r.body || '검증 실패'}`.slice(0,180));
     } catch (e) {
       setValidMsg(`✗ ${String(e.message||e).slice(0,120)}`);
     } finally { setValidating(false); }
@@ -767,15 +726,13 @@ function SettingsPage({ settings, setSettings }) {
           </div>
           <div className="text-xs text-slate-400 mono">현재 저장됨: {maskToken(settings.apiToken) || '(없음)'} {validMsg && <span className="ml-2">{validMsg}</span>}</div>
         </Field>
-        <Field label="API Base URL" hint="기본: https://image.novelai.net (생성 엔드포인트)">
-          <input className="input mono" value={apiBase} onChange={e=>setApiBase(e.target.value)} />
-        </Field>
-        <Field label="출력 폴더" hint="이미지와 metadata.json 이 이 폴더 아래에 세션별로 저장됩니다.">
-          <div className="flex items-center gap-2">
-            <span className="input flex-1 mono">{dirName}</span>
-            <button className="btn" onClick={pick}>폴더 선택</button>
-          </div>
-        </Field>
+        {isProxyMode() ? (
+          <div className="text-xs text-slate-400">프록시 모드 · <span className="mono">{apiBase}</span> (자동 설정됨)</div>
+        ) : (
+          <Field label="API Base URL" hint="기본: https://image.novelai.net (생성 엔드포인트)">
+            <input className="input mono" value={apiBase} onChange={e=>setApiBase(e.target.value)} />
+          </Field>
+        )}
         <div className="grid grid-cols-2 gap-4">
           <Field label="작업 사이 딜레이 (ms)"><input className="input" type="number" value={delay} onChange={e=>setDelay(e.target.value)} /></Field>
           <Field label="최대 재시도 횟수"><input className="input" type="number" value={maxRetry} onChange={e=>setMaxRetry(e.target.value)} /></Field>
@@ -1283,8 +1240,6 @@ function BatchRunPage({ characters, promptSets, settings }) {
     if (!selectedCharObjs.length) return setError('캐릭터를 1명 이상 선택하세요.');
     if (!promptSet) return setError('프롬프트 세트를 선택하세요.');
     if (!enabledSlotCount) return setError('활성화된 프롬프트 슬롯이 없습니다.');
-    const rootDir = await getStoredOutputDir();
-    if (!rootDir) return setError('출력 폴더가 선택되지 않았습니다. 설정에서 폴더를 선택하세요.');
 
     const sid = uid('sess');
     const session = {
@@ -1307,12 +1262,10 @@ function BatchRunPage({ characters, promptSets, settings }) {
 
   const start = async () => {
     setError('');
-    const rootDir = await getStoredOutputDir();
-    if (!rootDir) return setError('출력 폴더 권한이 필요합니다.');
     const jobs = (await db.jobsBySession(sessionObj?.id || runner.get().sessionId)).sort((a,b)=>a.order-b.order);
     if (!jobs.length) return setError('큐가 비었습니다.');
     const session = sessionObj || await db.get('sessions', runner.get().sessionId);
-    startRun({ session, jobs, preset: session.preset, settings, rootDir }).catch(e => { rlog('error', String(e.message||e)); });
+    startRun({ session, jobs, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
   };
 
   const pause = () => runner.set(s => ({ ...s, isPaused: true }));
@@ -1326,11 +1279,9 @@ function BatchRunPage({ characters, promptSets, settings }) {
     for (const j of failed) {
       await db.put('jobs', { ...j, status: 'pending', retryCount: 0, errorMessage: undefined, completedAt: undefined });
     }
-    const rootDir = await getStoredOutputDir();
-    if (!rootDir) return setError('출력 폴더 권한이 필요합니다.');
     const session = await db.get('sessions', runner.get().sessionId);
     const fresh = (await db.jobsBySession(session.id)).sort((a,b)=>a.order-b.order);
-    startRun({ session, jobs: fresh, preset: session.preset, settings, rootDir }).catch(e => { rlog('error', String(e.message||e)); });
+    startRun({ session, jobs: fresh, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
   };
 
   const progress = useMemo(() => {
@@ -1426,24 +1377,46 @@ function BatchRunPage({ characters, promptSets, settings }) {
   );
 }
 
+function JobImage({ jobId, size = 64 }) {
+  const [url, setUrl] = useState(null);
+  useEffect(() => {
+    let active = true;
+    let created = null;
+    (async () => {
+      const blob = await getImageBlob(jobId);
+      if (!active || !blob) return;
+      created = URL.createObjectURL(blob);
+      setUrl(created);
+    })();
+    return () => { active = false; if (created) URL.revokeObjectURL(created); };
+  }, [jobId]);
+  if (!url) return <div className="text-slate-600 text-xs">—</div>;
+  return (
+    <a href={url} target="_blank" rel="noreferrer" title="새 탭에서 원본 열기">
+      <img src={url} alt="" style={{width: size, height: size, objectFit: 'cover'}} className="rounded border border-slate-700" />
+    </a>
+  );
+}
+
 function QueueTable({ jobs }) {
   if (!jobs.length) return <div className="text-slate-500 text-sm">큐가 비었습니다. “큐 생성”을 누르세요.</div>;
   return (
-    <div className="overflow-auto max-h-96">
+    <div className="overflow-auto max-h-[600px]">
       <table className="w-full text-sm">
         <thead className="text-xs text-slate-400 sticky top-0 bg-[#131826]">
-          <tr><th className="text-left p-2">#</th><th className="text-left p-2">캐릭터</th><th className="text-left p-2">프롬프트</th><th className="text-left p-2">상태</th><th className="text-left p-2">seed</th><th className="text-left p-2">재시도</th><th className="text-left p-2">경로/오류</th></tr>
+          <tr><th className="text-left p-2">#</th><th className="text-left p-2">미리보기</th><th className="text-left p-2">캐릭터</th><th className="text-left p-2">프롬프트</th><th className="text-left p-2">상태</th><th className="text-left p-2">seed</th><th className="text-left p-2">재시도</th><th className="text-left p-2">오류</th></tr>
         </thead>
         <tbody>
           {jobs.map(j => (
             <tr key={j.id} className="row-hover border-t border-slate-800/60">
-              <td className="p-2 mono">{pad(j.order)}</td>
-              <td className="p-2">{j.characterName}</td>
-              <td className="p-2 truncate max-w-[200px]">{j.promptTitle}</td>
-              <td className="p-2"><Badge status={j.status} /></td>
-              <td className="p-2 mono text-xs">{j.seed ?? '-'}</td>
-              <td className="p-2 mono text-xs">{j.retryCount || 0}</td>
-              <td className="p-2 text-xs truncate max-w-[280px]" title={j.errorMessage || j.outputPath}>{j.errorMessage ? <span className="text-red-400">{j.errorMessage}</span> : (j.outputPath || '')}</td>
+              <td className="p-2 mono align-middle">{pad(j.order)}</td>
+              <td className="p-2 align-middle">{j.status === 'success' ? <JobImage jobId={j.id} /> : <div className="w-16 h-16 rounded border border-dashed border-slate-700" />}</td>
+              <td className="p-2 align-middle">{j.characterName}</td>
+              <td className="p-2 truncate max-w-[200px] align-middle">{j.promptTitle}</td>
+              <td className="p-2 align-middle"><Badge status={j.status} /></td>
+              <td className="p-2 mono text-xs align-middle">{j.seed ?? '-'}</td>
+              <td className="p-2 mono text-xs align-middle">{j.retryCount || 0}</td>
+              <td className="p-2 text-xs truncate max-w-[280px] align-middle" title={j.errorMessage}>{j.errorMessage ? <span className="text-red-400">{j.errorMessage}</span> : ''}</td>
             </tr>
           ))}
         </tbody>
@@ -1488,6 +1461,7 @@ function SessionsPage({ characters, promptSets }) {
     await db.delete('sessions', id);
     const jobs = await db.jobsBySession(id);
     for (const j of jobs) await db.delete('jobs', j.id);
+    await deleteImagesBySession(id);
     if (openId === id) setOpenId(null);
     reload();
   };
@@ -1621,6 +1595,23 @@ function App() {
 
   const r = useStore(runner);
 
+  useEffect(() => {
+    if (!settings.apiToken) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const a = await novelaiGetSubscription(settings.apiBase, settings.apiToken);
+        if (!cancelled) runner.set(s => ({ ...s, anlas: { ...s.anlas, balance: a.total } }));
+      } catch {}
+    };
+    refresh();
+    const t = setInterval(refresh, 60000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [settings.apiToken, settings.apiBase]);
+
+  const anlasConsumed = (r.anlas?.sessionStart != null && r.anlas?.balance != null)
+    ? Math.max(0, r.anlas.sessionStart - r.anlas.balance) : 0;
+
   return (
     <div className="h-full flex">
       <aside className="w-64 shrink-0 border-r border-slate-800/60 p-3 flex flex-col gap-1">
@@ -1635,6 +1626,10 @@ function App() {
         ))}
         <div className="mt-auto p-2 text-xs text-slate-500 space-y-1">
           <div>토큰: <span className="mono">{maskToken(settings.apiToken)||'(없음)'}</span></div>
+          <div>
+            Anlas: <span className="mono text-slate-300">{r.anlas?.balance != null ? r.anlas.balance.toLocaleString() : '—'}</span>
+            {anlasConsumed > 0 && <span className="ml-1 text-amber-300">(이번 세션 -{anlasConsumed.toLocaleString()})</span>}
+          </div>
           <div>실행: <span className={r.isRunning?'text-emerald-400':'text-slate-400'}>{r.isRunning?(r.isPaused?'paused':'running'):'idle'}</span></div>
         </div>
       </aside>

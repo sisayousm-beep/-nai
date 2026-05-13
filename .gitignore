@@ -21,3 +21,8 @@ build/
 .env
 .env.local
 *.log
+
+# Python (proxy)
+__pycache__/
+*.pyc
+.venv/
