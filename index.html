@@ -124,10 +124,70 @@ async function blobToBase64(blob) {
   return btoa(bin);
 }
 
+async function blobToCharRefJpegBase64(blob) {
+  // NAIS2 spec: PR/Director Reference uses JPEG with specific letterboxed dimensions.
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error('이미지 로드 실패'));
+      i.src = url;
+    });
+    const sw = img.naturalWidth, sh = img.naturalHeight;
+    let tw = 1472, th = 1472;
+    if (sw > sh) { tw = 1536; th = 1024; }
+    else if (sw < sh) { tw = 1024; th = 1536; }
+    const canvas = document.createElement('canvas');
+    canvas.width = tw; canvas.height = th;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, tw, th);
+    const scale = Math.min(tw / sw, th / sh);
+    const w = sw * scale, h = sh * scale;
+    ctx.drawImage(img, (tw - w) / 2, (th - h) / 2, w, h);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+    return dataUrl.split(',')[1];
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function blobToPngBase64(blob, maxDim = 1024) {
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error('이미지 로드 실패'));
+      i.src = url;
+    });
+    let w = img.naturalWidth, h = img.naturalHeight;
+    const longest = Math.max(w, h);
+    if (longest > maxDim) {
+      const scale = maxDim / longest;
+      w = Math.round(w * scale);
+      h = Math.round(h * scale);
+    }
+    // round to multiples of 8 — many AI image pipelines require this
+    w = Math.max(64, Math.round(w / 8) * 8);
+    h = Math.max(64, Math.round(h / 8) * 8);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+    const pngBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!pngBlob) throw new Error('PNG 인코딩 실패');
+    return await blobToBase64(pngBlob);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 /* ============ IndexedDB ============ */
 const DB_NAME = 'nai-batch-runner';
-const DB_VERSION = 2;
-const STORES = ['characters', 'promptSets', 'sessions', 'jobs', 'kv', 'images'];
+const DB_VERSION = 3;
+const STORES = ['characters', 'promptSets', 'sessions', 'jobs', 'kv', 'images', 'batchPresets'];
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -426,8 +486,8 @@ function buildQueue({ characters, promptSet, sessionId, batch, preset }) {
 function sanitizePayloadForLog(payload) {
   const clone = JSON.parse(JSON.stringify(payload));
   const p = clone.parameters || {};
-  if (Array.isArray(p.reference_image_multiple)) {
-    p.reference_image_multiple = p.reference_image_multiple.map(s => `<base64 ${(s||'').length}>`);
+  for (const k of ['reference_image_multiple', 'director_reference_images']) {
+    if (Array.isArray(p[k])) p[k] = p[k].map(s => `<base64 ${(s||'').length}>`);
   }
   return JSON.stringify(clone);
 }
@@ -439,9 +499,22 @@ function buildPayload({ job, preset, seed, refs }) {
 
   const refParams = {};
   if (refs && refs.length) {
-    refParams.reference_image_multiple = refs.map(r => r.base64);
-    refParams.reference_strength_multiple = refs.map(r => Number(r.strength ?? 0.6));
-    refParams.reference_information_extracted_multiple = refs.map(r => Number(r.fidelity ?? 1.0));
+    if (isV4) {
+      // PR / Director Tools (per NAIS2 reverse engineering)
+      refParams.director_reference_images = refs.map(r => r.base64);
+      refParams.director_reference_information_extracted = refs.map(() => 1);
+      refParams.director_reference_strength_values = refs.map(r => Number(r.strength ?? 1.0));
+      refParams.director_reference_secondary_strength_values = refs.map(r => 1 - Number(r.fidelity ?? 1.0));
+      refParams.director_reference_descriptions = refs.map(r => ({
+        caption: { base_caption: r.mode || 'character', char_captions: [] },
+        legacy_uc: false,
+      }));
+    } else {
+      // v3 Vibe Transfer
+      refParams.reference_image_multiple = refs.map(r => r.base64);
+      refParams.reference_strength_multiple = refs.map(r => Number(r.strength ?? 1.0));
+      refParams.reference_information_extracted_multiple = refs.map(r => Number(r.fidelity ?? 1.0));
+    }
   }
 
   const params = {
@@ -504,6 +577,31 @@ async function novelaiValidateToken(apiBase, token) {
   return { ok: false, status: res.status, body };
 }
 
+async function novelaiEncodeVibe(apiBase, token, imageBase64, infoExtracted, model) {
+  const url = `${apiBase.replace(/\/$/,'')}/ai/encode-vibe`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ image: imageBase64, information_extracted: infoExtracted, model }),
+  });
+  if (!res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch {}
+    throw new Error(`encode-vibe ${res.status}: ${body.slice(0,200)}`);
+  }
+  const ct = res.headers.get('Content-Type') || '';
+  if (ct.includes('json')) {
+    const j = await res.json();
+    return j.image || j.vibe || j.encoded || '';
+  }
+  const buf = await res.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return btoa(bin);
+}
+
 async function novelaiGetSubscription(apiBase, token) {
   // GET /user/subscription → Anlas 잔량
   const url = `${apiBase.replace(/\/$/,'')}/user/subscription`.replace('image.novelai.net','api.novelai.net');
@@ -563,6 +661,9 @@ async function deleteImagesBySession(sessionId) {
 
 /* ============ Runner ============ */
 async function startRun({ session, jobs, preset, settings }) {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    try { await Notification.requestPermission(); } catch {}
+  }
   runner.set({ isRunning: true, isPaused: false, isCancelling: false, sessionId: session.id, current: null, logs: [], anlas: { balance: null, sessionStart: null } });
   rlog('info', `세션 시작: ${session.name} (jobs=${jobs.length})`);
 
@@ -578,19 +679,36 @@ async function startRun({ session, jobs, preset, settings }) {
   // restore per-character seeds from already-running session if reload
   const characters = await db.getAll('characters');
   const charById = new Map(characters.map(c => [c.id, c]));
-  // PR reference cache: characterId → refs array (raw base64, no encoding)
+  // PR reference cache: characterId → refs array
   const refCache = new Map();
+  const isV4ModelHere = /^nai-diffusion-4/.test(preset.model);
   let firstPayloadLogged = false;
   async function getRefsFor(character) {
     if (refCache.has(character.id)) return refCache.get(character.id);
     const raw = (character.referenceImages || []).filter(r => r.enabled !== false && r.blob);
     if (!raw.length) { refCache.set(character.id, []); return []; }
-    const out = await Promise.all(raw.map(async (r) => ({
-      base64: await blobToBase64(r.blob),
-      strength: Number.isFinite(r.strength) ? r.strength : 0.6,
-      fidelity: Number.isFinite(r.fidelity) ? r.fidelity : 1.0,
-      mode: r.mode || 'character',
-    })));
+    const out = [];
+    for (const r of raw) {
+      const strength = Number.isFinite(r.strength) ? r.strength : 1.0;
+      const fidelity = Number.isFinite(r.fidelity) ? r.fidelity : 1.0;
+      const mode = r.mode || 'character';
+      let base64;
+      if (isV4ModelHere) {
+        // PR (Director Tools): JPEG letterboxed, no encoding step
+        base64 = await blobToCharRefJpegBase64(r.blob);
+      } else {
+        // v3 Vibe Transfer: PNG → encode-vibe → token
+        const pngBase64 = await blobToPngBase64(r.blob);
+        try {
+          rlog('info', `Vibe 인코딩 중 (${character.name}, info=${fidelity})…`);
+          base64 = await novelaiEncodeVibe(settings.apiBase, settings.apiToken, pngBase64, fidelity, preset.model);
+        } catch (e) {
+          rlog('warn', `Vibe 인코딩 실패 (${character.name}): ${e.message||e} — 해당 ref 스킵`);
+          continue;
+        }
+      }
+      out.push({ base64, strength, fidelity, mode });
+    }
     refCache.set(character.id, out);
     return out;
   }
@@ -605,7 +723,7 @@ async function startRun({ session, jobs, preset, settings }) {
     if (runner.get().isCancelling) break;
 
     let job = jobs[i];
-    if (job.status === 'success' || job.status === 'skipped') continue;
+    if (job.status !== 'pending') continue;
     const character = charById.get(job.characterId);
     if (!character) {
       job = { ...job, status: 'failed', errorMessage: '캐릭터를 찾을 수 없음', completedAt: nowIso() };
@@ -669,8 +787,9 @@ async function startRun({ session, jobs, preset, settings }) {
     await sleep(settings.delayBetweenJobsMs);
   }
 
+  const wasCancelled = runner.get().isCancelling;
   // Mark remaining pending as cancelled if cancelling
-  if (runner.get().isCancelling) {
+  if (wasCancelled) {
     for (let i = 0; i < jobs.length; i++) {
       if (jobs[i].status === 'pending' || jobs[i].status === 'running') {
         const j = { ...jobs[i], status: 'cancelled', completedAt: nowIso() };
@@ -685,6 +804,22 @@ async function startRun({ session, jobs, preset, settings }) {
   await db.put('sessions', session);
 
   runner.set({ isRunning: false, isPaused: false, isCancelling: false, sessionId: session.id, current: null, logs: runner.get().logs });
+
+  // Desktop notification on completion
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    const succ = jobs.filter(j => j.status === 'success').length;
+    const fail = jobs.filter(j => j.status === 'failed').length;
+    const canc = jobs.filter(j => j.status === 'cancelled').length;
+    const parts = [`성공 ${succ}장`];
+    if (fail) parts.push(`실패 ${fail}`);
+    if (canc) parts.push(`취소 ${canc}`);
+    try {
+      new Notification(wasCancelled ? `NAI 배치 중단됨: ${session.name}` : `NAI 배치 완료: ${session.name}`, {
+        body: parts.join(' · '),
+      });
+    } catch {}
+  }
+
   rlog('info', `세션 종료: ${session.name}`);
 }
 
@@ -778,6 +913,7 @@ function SettingsPage({ settings, setSettings }) {
 
 function CharactersPage({ characters, reload }) {
   const [editing, setEditing] = useState(null); // character or 'new'
+  const [importMsg, setImportMsg] = useState('');
   const isNew = editing === 'new';
 
   const create = () => setEditing('new');
@@ -800,35 +936,327 @@ function CharactersPage({ characters, reload }) {
     reload();
   };
 
+  const importFromFile = async () => {
+    setImportMsg('');
+    const file = await pickJsonFile();
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const json = JSON.parse(text);
+      const list = Array.isArray(json) ? json : (json.characters || []);
+      if (!Array.isArray(list) || !list.length) throw new Error('characters 배열을 찾을 수 없거나 비어있습니다.');
+      const now = nowIso();
+      let added = 0, skipped = 0;
+      for (const c of list) {
+        if (!c?.name) { skipped += 1; continue; }
+        const ch = {
+          id: uid('char'),
+          createdAt: now,
+          updatedAt: now,
+          name: String(c.name),
+          group: String(c.group || ''),
+          basePrompt: String(c.basePrompt || ''),
+          negativePrompt: String(c.negativePrompt || ''),
+          defaultSeedMode: c.defaultSeedMode || 'random',
+          fixedSeed: c.fixedSeed,
+          outputFolderName: c.outputFolderName || c.name,
+          tags: Array.isArray(c.tags) ? c.tags : [],
+          referenceImages: [],
+        };
+        await db.put('characters', ch);
+        added += 1;
+      }
+      setImportMsg(`✓ ${added}명 가져옴${skipped ? ` · ${skipped}개 스킵` : ''}`);
+      reload();
+    } catch (e) {
+      setImportMsg(`✗ 가져오기 실패: ${e.message || e}`);
+    }
+  };
+
+  // Character selection state + scope (전체 / 선택 / 미분류)
+  const [selectedCharIds, setSelectedCharIds] = useState(() => new Set());
+  const [scope, setScope] = useState('all'); // 'all' | 'selected' | 'unsorted'
+  // prune stale ids when characters change
+  useEffect(() => {
+    const curIds = new Set(characters.map(c => c.id));
+    setSelectedCharIds(prev => {
+      let changed = false;
+      const ns = new Set();
+      for (const id of prev) { if (curIds.has(id)) ns.add(id); else changed = true; }
+      return changed ? ns : prev;
+    });
+  }, [characters]);
+  const toggleSelectChar = (id) => setSelectedCharIds(prev => {
+    const ns = new Set(prev);
+    if (ns.has(id)) ns.delete(id); else ns.add(id);
+    return ns;
+  });
+  const unsortedCount = useMemo(() => characters.filter(c => !c.group).length, [characters]);
+  const inScope = (c) => scope === 'selected' ? selectedCharIds.has(c.id)
+    : scope === 'unsorted' ? !c.group
+    : true;
+  const scopedChars = useMemo(() => characters.filter(inScope), [characters, scope, selectedCharIds]);
+
+  const exportAll = () => {
+    const list = scopedChars;
+    if (!list.length) { setImportMsg('✗ 대상 캐릭터가 없습니다.'); return; }
+    const backup = {
+      kind: 'nai-batch-runner.characters',
+      version: 1,
+      exportedAt: nowIso(),
+      characters: list.map(c => ({
+        name: c.name,
+        group: c.group || '',
+        basePrompt: c.basePrompt || '',
+        negativePrompt: c.negativePrompt || '',
+        defaultSeedMode: c.defaultSeedMode || 'random',
+        fixedSeed: c.fixedSeed,
+        outputFolderName: c.outputFolderName,
+        tags: c.tags || [],
+      })),
+    };
+    const label = scope === 'selected' ? 'selected' : scope === 'unsorted' ? 'unsorted' : 'all';
+    downloadBlob(`NAI_Characters_${label}_${Date.now()}.json`, new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }));
+  };
+
+  const prFolderInputRef = useRef(null);
+  useEffect(() => {
+    if (prFolderInputRef.current) prFolderInputRef.current.setAttribute('webkitdirectory', '');
+  }, []);
+
+  const importPrImages = async (files) => {
+    setImportMsg('');
+    if (!files?.length) return;
+    const imageFiles = files.filter(f => /\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name));
+    if (!imageFiles.length) { setImportMsg('✗ 이미지 파일 없음'); return; }
+
+    const allChars = await db.getAll('characters');
+    if (!allChars.length) { setImportMsg('✗ 매칭할 캐릭터가 없습니다 (먼저 캐릭터를 가져오세요)'); return; }
+    // restrict matching pool by current scope
+    const pool = scope === 'selected' ? allChars.filter(c => selectedCharIds.has(c.id))
+      : scope === 'unsorted' ? allChars.filter(c => !c.group)
+      : allChars;
+    if (!pool.length) { setImportMsg('✗ 대상 캐릭터가 없습니다.'); return; }
+    // sort by name length desc so longer names match before being absorbed by shorter substrings
+    const charsByLenDesc = [...pool].sort((a, b) => (b.name?.length||0) - (a.name?.length||0));
+
+    let matched = 0, missed = 0;
+    const missedFiles = [];
+    // Group matches by character so we update once per character (avoid stale referenceImages reads)
+    const updates = new Map(); // characterId → updated character object
+
+    for (const file of imageFiles) {
+      const stem = file.name.replace(/\.[^.]+$/, '');
+      let target = null;
+      // 1) match by filename
+      for (const c of charsByLenDesc) {
+        if (c.name && stem.includes(c.name)) { target = c; break; }
+      }
+      // 2) fallback: match by parent folder name (strip leading digits/underscores)
+      if (!target && file.webkitRelativePath) {
+        const parts = file.webkitRelativePath.split('/');
+        if (parts.length >= 2) {
+          const folder = parts[parts.length - 2].replace(/^\d+[_\-\s]*/, '').trim();
+          for (const c of charsByLenDesc) {
+            if (c.name && folder.includes(c.name)) { target = c; break; }
+          }
+        }
+      }
+      if (!target) { missed += 1; missedFiles.push(file.name); continue; }
+      const cur = updates.get(target.id) || { ...target, referenceImages: [...(target.referenceImages || [])] };
+      cur.referenceImages.push({
+        id: uid('ref'),
+        blob: file,
+        mimeType: file.type || 'image/png',
+        filename: file.name,
+        enabled: true,
+        mode: 'character',
+        strength: 1.0,
+        fidelity: 1.0,
+      });
+      cur.updatedAt = nowIso();
+      updates.set(target.id, cur);
+      matched += 1;
+    }
+
+    for (const ch of updates.values()) {
+      await db.put('characters', ch);
+    }
+    setImportMsg(`✓ ${matched}장 추가 (${updates.size}명)${missed ? ` · ${missed}장 매칭 실패${missedFiles.length<=5?': '+missedFiles.join(', '):''}` : ''}`);
+    reload();
+  };
+
+  const onPrFolderChange = (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    importPrImages(files);
+  };
+
+  // Collapsed group state (persisted in localStorage)
+  const [collapsedGroups, setCollapsedGroups] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('nai-char-collapsed') || '[]')); }
+    catch { return new Set(); }
+  });
+  useEffect(() => {
+    localStorage.setItem('nai-char-collapsed', JSON.stringify(Array.from(collapsedGroups)));
+  }, [collapsedGroups]);
+  const toggleGroup = (g) => setCollapsedGroups(prev => {
+    const ns = new Set(prev);
+    if (ns.has(g)) ns.delete(g); else ns.add(g);
+    return ns;
+  });
+
+  // Group characters by `group` field
+  const grouped = useMemo(() => {
+    const map = new Map();
+    for (const c of characters) {
+      const g = c.group || '미분류';
+      if (!map.has(g)) map.set(g, []);
+      map.get(g).push(c);
+    }
+    // sort groups: named first (alphabetical), 미분류 last
+    return [...map.entries()].sort((a, b) => {
+      if (a[0] === '미분류') return 1;
+      if (b[0] === '미분류') return -1;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [characters]);
+
+  const allGroupNames = grouped.map(([g]) => g);
+  const collapseAll = () => setCollapsedGroups(new Set(allGroupNames));
+  const expandAll = () => setCollapsedGroups(new Set());
+
+  // Bulk: assign group + reset PR strength (scope-aware)
+  const bulkAssign = async () => {
+    if (!scopedChars.length) { setImportMsg('✗ 대상 캐릭터가 없습니다.'); return; }
+    const scopeLabel = scope === 'selected' ? '선택' : scope === 'unsorted' ? '미분류' : '전체';
+    const groupName = (window.prompt(`${scopeLabel} ${scopedChars.length}명을 어느 그룹으로 묶을까요?\n(기존 그룹값을 덮어씁니다)`, '혼돈무림') || '').trim();
+    if (!groupName) return;
+    if (!window.confirm(`${scopeLabel} ${scopedChars.length}명을 "${groupName}" 그룹에 배정하고, 모든 PR 이미지의 strength·fidelity 를 1.0 으로 설정합니다. 계속할까요?`)) return;
+    const all = await db.getAll('characters');
+    const targetIds = new Set(scopedChars.map(c => c.id));
+    const now = nowIso();
+    let touched = 0;
+    for (const c of all) {
+      if (!targetIds.has(c.id)) continue;
+      c.group = groupName;
+      if (Array.isArray(c.referenceImages)) {
+        c.referenceImages = c.referenceImages.map(r => ({ ...r, strength: 1.0, fidelity: 1.0, mode: r.mode || 'character' }));
+      }
+      c.updatedAt = now;
+      await db.put('characters', c);
+      touched += 1;
+    }
+    setImportMsg(`✓ ${scopeLabel} ${touched}명을 "${groupName}" 그룹으로, PR strength·fidelity 1.0 으로 일괄 설정`);
+    reload();
+  };
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="text-xl font-semibold">캐릭터</h2>
-        <button className="btn btn-primary" onClick={create}>+ 새 캐릭터</button>
+        <div className="flex gap-2 flex-wrap">
+          <button className="btn" onClick={importFromFile}>JSON 가져오기</button>
+          <button className="btn" onClick={() => prFolderInputRef.current?.click()} disabled={!scopedChars.length} title="폴더 선택 → 각 이미지 파일을 캐릭터 이름으로 매칭해 PR 에 추가">PR 이미지 폴더 일괄 ({scopedChars.length})</button>
+          <input ref={prFolderInputRef} type="file" style={{display:'none'}} multiple onChange={onPrFolderChange} />
+          <button className="btn" onClick={bulkAssign} disabled={!scopedChars.length} title="대상 캐릭터를 같은 그룹에 묶고 PR strength/fidelity 를 1.0 으로 재설정">일괄 정리 ({scopedChars.length})</button>
+          <button className="btn" onClick={exportAll} disabled={!scopedChars.length}>내보내기 ({scopedChars.length})</button>
+          <button className="btn btn-primary" onClick={create}>+ 새 캐릭터</button>
+        </div>
       </div>
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-        {characters.map(c => (
-          <div key={c.id} className="card p-4 space-y-2">
-            <div className="flex items-start justify-between">
-              <div>
-                <div className="font-semibold flex items-center gap-2">
-                  <span>{c.name}</span>
-                  {(c.referenceImages?.filter(r=>r.enabled!==false).length || 0) > 0 && <span className="badge badge-running">PR {c.referenceImages.filter(r=>r.enabled!==false).length}</span>}
-                </div>
-                <div className="text-xs text-slate-400">seed: {c.defaultSeedMode}{c.fixedSeed!=null?` · ${c.fixedSeed}`:''}</div>
-              </div>
-              <div className="flex gap-1">
-                <button className="btn btn-ghost" onClick={()=>edit(c)}>편집</button>
-                <button className="btn btn-ghost" onClick={()=>dup(c)}>복제</button>
-                <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={()=>del(c)}>삭제</ConfirmButton>
-              </div>
-            </div>
-            <div className="text-sm text-slate-300 line-clamp-3 mono">{c.basePrompt || <span className="text-slate-500">basePrompt 없음</span>}</div>
-            {c.negativePrompt && <div className="text-xs text-slate-500 line-clamp-2 mono">neg: {c.negativePrompt}</div>}
+
+      {characters.length > 0 && (
+        <div className="flex items-center gap-2 flex-wrap text-xs">
+          <span className="text-slate-400">대상</span>
+          <button className={`btn ${scope==='all'?'btn-primary':'btn-ghost'}`} onClick={()=>setScope('all')}>전체 ({characters.length})</button>
+          <button className={`btn ${scope==='selected'?'btn-primary':'btn-ghost'}`} onClick={()=>setScope('selected')} disabled={selectedCharIds.size===0} title={selectedCharIds.size===0?'카드 체크박스로 캐릭터를 먼저 선택하세요':''}>선택 ({selectedCharIds.size})</button>
+          <button className={`btn ${scope==='unsorted'?'btn-primary':'btn-ghost'}`} onClick={()=>setScope('unsorted')} disabled={unsortedCount===0}>미분류 ({unsortedCount})</button>
+          {selectedCharIds.size > 0 && <button className="btn btn-ghost ml-2" onClick={()=>setSelectedCharIds(new Set())}>선택 해제</button>}
+        </div>
+      )}
+
+      {importMsg && <div className={`card p-3 text-sm ${importMsg.startsWith('✓')?'text-emerald-300':'text-red-300'}`}>{importMsg}</div>}
+
+      {characters.length === 0 ? (
+        <div className="text-slate-500">아직 캐릭터가 없습니다. 새 캐릭터를 추가하세요.</div>
+      ) : (
+        <>
+          <div className="flex items-center gap-2 text-xs text-slate-400">
+            <span>총 {characters.length}명 · {grouped.length}그룹</span>
+            <button className="btn btn-ghost ml-auto" onClick={expandAll}>모두 펼치기</button>
+            <button className="btn btn-ghost" onClick={collapseAll}>모두 접기</button>
           </div>
-        ))}
-        {characters.length === 0 && <div className="text-slate-500 col-span-full">아직 캐릭터가 없습니다. 새 캐릭터를 추가하세요.</div>}
-      </div>
+          <div className="space-y-4">
+            {grouped.map(([groupName, chars]) => {
+              const isCollapsed = collapsedGroups.has(groupName);
+              const groupAllSelected = chars.length > 0 && chars.every(c => selectedCharIds.has(c.id));
+              const groupSomeSelected = chars.some(c => selectedCharIds.has(c.id));
+              const groupIndeterminate = groupSomeSelected && !groupAllSelected;
+              const toggleGroupSelection = () => {
+                setSelectedCharIds(prev => {
+                  const ns = new Set(prev);
+                  if (groupAllSelected) {
+                    for (const c of chars) ns.delete(c.id);
+                  } else {
+                    for (const c of chars) ns.add(c.id);
+                  }
+                  return ns;
+                });
+              };
+              const groupSelectedCount = chars.filter(c => selectedCharIds.has(c.id)).length;
+              return (
+                <div key={groupName} className="space-y-2">
+                  <div
+                    className="flex items-center gap-2 select-none cursor-pointer border-b border-slate-800/60 pb-1 hover:text-blue-300"
+                    onClick={() => toggleGroup(groupName)}
+                  >
+                    <span className="text-slate-400 mono w-4">{isCollapsed ? '▶' : '▼'}</span>
+                    <input
+                      type="checkbox"
+                      checked={groupAllSelected}
+                      ref={el => { if (el) el.indeterminate = groupIndeterminate; }}
+                      onChange={toggleGroupSelection}
+                      onClick={(e) => e.stopPropagation()}
+                      title="그룹 전체 선택/해제"
+                    />
+                    <span className="font-medium">{groupName}</span>
+                    <span className="text-xs text-slate-500">
+                      ({groupSelectedCount > 0 ? `${groupSelectedCount}/` : ''}{chars.length}명)
+                    </span>
+                  </div>
+                  {!isCollapsed && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                      {chars.map(c => (
+                        <div key={c.id} className={`card p-4 space-y-2 ${selectedCharIds.has(c.id) ? 'ring-2 ring-blue-500/60' : ''}`}>
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="flex items-start gap-2 min-w-0">
+                              <input type="checkbox" className="mt-1 shrink-0" checked={selectedCharIds.has(c.id)} onChange={()=>toggleSelectChar(c.id)} title="대상 선택" />
+                              <div className="min-w-0">
+                                <div className="font-semibold flex items-center gap-2">
+                                  <span className="truncate">{c.name}</span>
+                                  {(c.referenceImages?.filter(r=>r.enabled!==false).length || 0) > 0 && <span className="badge badge-running">PR {c.referenceImages.filter(r=>r.enabled!==false).length}</span>}
+                                </div>
+                                <div className="text-xs text-slate-400">seed: {c.defaultSeedMode}{c.fixedSeed!=null?` · ${c.fixedSeed}`:''}</div>
+                              </div>
+                            </div>
+                            <div className="flex gap-1 shrink-0">
+                              <button className="btn btn-ghost" onClick={()=>edit(c)}>편집</button>
+                              <button className="btn btn-ghost" onClick={()=>dup(c)}>복제</button>
+                              <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={()=>del(c)}>삭제</ConfirmButton>
+                            </div>
+                          </div>
+                          <div className="text-sm text-slate-300 line-clamp-3 mono">{c.basePrompt || <span className="text-slate-500">basePrompt 없음</span>}</div>
+                          {c.negativePrompt && <div className="text-xs text-slate-500 line-clamp-2 mono">neg: {c.negativePrompt}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
       {editing && <CharacterEditor key={isNew?'new':editing.id} initial={isNew?null:editing} onCancel={()=>setEditing(null)} onSave={save} />}
     </div>
   );
@@ -836,7 +1264,7 @@ function CharactersPage({ characters, reload }) {
 
 function CharacterEditor({ initial, onCancel, onSave }) {
   const [draft, setDraft] = useState(initial || {
-    name: '', basePrompt: '', negativePrompt: '', defaultSeedMode: 'random', fixedSeed: '', outputFolderName: '', tags: [], referenceImages: []
+    name: '', group: '', basePrompt: '', negativePrompt: '', defaultSeedMode: 'random', fixedSeed: '', outputFolderName: '', tags: [], referenceImages: []
   });
   const upd = (patch) => setDraft(d => ({ ...d, ...patch }));
   const valid = draft.name.trim().length > 0;
@@ -863,7 +1291,7 @@ function CharacterEditor({ initial, onCancel, onSave }) {
       filename: f.name,
       enabled: true,
       mode: 'character',
-      strength: 0.6,
+      strength: 1.0,
       fidelity: 1.0,
     }));
     setDraft(d => ({ ...d, referenceImages: [...(d.referenceImages||[]), ...picked] }));
@@ -874,7 +1302,10 @@ function CharacterEditor({ initial, onCancel, onSave }) {
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onCancel}>
       <div className="card p-5 w-full max-w-2xl space-y-3 max-h-[90vh] overflow-auto" onClick={e=>e.stopPropagation()}>
         <h3 className="text-lg font-semibold">{initial ? '캐릭터 편집' : '새 캐릭터'}</h3>
-        <Field label="이름"><input className="input" value={draft.name} onChange={e=>upd({name:e.target.value})} /></Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="이름"><input className="input" value={draft.name} onChange={e=>upd({name:e.target.value})} /></Field>
+          <Field label="그룹 (선택)" hint="같은 그룹끼리 묶여 표시됩니다."><input className="input" value={draft.group||''} onChange={e=>upd({group:e.target.value})} placeholder="예: 혼돈무림" /></Field>
+        </div>
         <Field label="저장 폴더명 (선택)"><input className="input mono" value={draft.outputFolderName} onChange={e=>upd({outputFolderName:e.target.value})} placeholder="비우면 이름을 사용" /></Field>
         <Field label="기본 프롬프트"><textarea className="input mono" value={draft.basePrompt} onChange={e=>upd({basePrompt:e.target.value})} /></Field>
         <Field label="네거티브 프롬프트 (선택)"><textarea className="input mono" value={draft.negativePrompt} onChange={e=>upd({negativePrompt:e.target.value})} /></Field>
@@ -934,9 +1365,9 @@ function RefImageRow({ r, onUpdate, onRemove }) {
         <div className="grid grid-cols-2 gap-3">
           <div>
             <div className="flex items-center justify-between text-xs text-slate-300">
-              <span>Strength</span><span className="mono">{Number(r.strength??0.6).toFixed(2)}</span>
+              <span>Strength</span><span className="mono">{Number(r.strength??1.0).toFixed(2)}</span>
             </div>
-            <input type="range" min="0" max="1" step="0.05" value={r.strength??0.6} onChange={e=>onUpdate({strength:Number(e.target.value)})} className="w-full" />
+            <input type="range" min="0" max="1" step="0.05" value={r.strength??1.0} onChange={e=>onUpdate({strength:Number(e.target.value)})} className="w-full" />
           </div>
           <div>
             <div className="flex items-center justify-between text-xs text-slate-300">
@@ -1146,10 +1577,179 @@ function PresetForm({ preset, onChange }) {
   );
 }
 
+function CharacterPicker({ characters, selectedChars, setSelectedChars }) {
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem('nai-batch-char-collapsed') || '[]')); }
+    catch { return new Set(); }
+  });
+  useEffect(() => {
+    localStorage.setItem('nai-batch-char-collapsed', JSON.stringify(Array.from(collapsed)));
+  }, [collapsed]);
+  const toggleGroup = (g) => setCollapsed(prev => {
+    const ns = new Set(prev);
+    if (ns.has(g)) ns.delete(g); else ns.add(g);
+    return ns;
+  });
+
+  const grouped = useMemo(() => {
+    const map = new Map();
+    for (const c of characters) {
+      const g = c.group || '미분류';
+      if (!map.has(g)) map.set(g, []);
+      map.get(g).push(c);
+    }
+    return [...map.entries()].sort((a, b) => {
+      if (a[0] === '미분류') return 1;
+      if (b[0] === '미분류') return -1;
+      return a[0].localeCompare(b[0]);
+    });
+  }, [characters]);
+
+  const selectedSet = new Set(selectedChars);
+  const toggleChar = (id) => setSelectedChars(prev => prev.includes(id) ? prev.filter(x=>x!==id) : [...prev, id]);
+
+  const collapseAll = () => setCollapsed(new Set(grouped.map(([g]) => g)));
+  const expandAll = () => setCollapsed(new Set());
+
+  return (
+    <div className="card p-4 space-y-3">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div className="font-semibold">캐릭터 선택 <span className="text-xs text-slate-400">({selectedChars.length}/{characters.length})</span></div>
+        <div className="flex gap-2 text-xs">
+          <button className="btn btn-ghost" onClick={()=>setSelectedChars(characters.map(c=>c.id))}>전체</button>
+          <button className="btn btn-ghost" onClick={()=>setSelectedChars([])}>해제</button>
+          <button className="btn btn-ghost" onClick={expandAll}>모두 펼치기</button>
+          <button className="btn btn-ghost" onClick={collapseAll}>모두 접기</button>
+        </div>
+      </div>
+      <div className="max-h-[28rem] overflow-auto space-y-3">
+        {grouped.map(([groupName, chars]) => {
+          const isCollapsed = collapsed.has(groupName);
+          const allSelected = chars.length > 0 && chars.every(c => selectedSet.has(c.id));
+          const someSelected = chars.some(c => selectedSet.has(c.id));
+          const indeterminate = someSelected && !allSelected;
+          const groupSelectedCount = chars.filter(c => selectedSet.has(c.id)).length;
+          const toggleGroupSelection = () => {
+            setSelectedChars(prev => {
+              const set = new Set(prev);
+              if (allSelected) { for (const c of chars) set.delete(c.id); }
+              else { for (const c of chars) set.add(c.id); }
+              return Array.from(set);
+            });
+          };
+          return (
+            <div key={groupName} className="space-y-1">
+              <div
+                className="flex items-center gap-2 select-none cursor-pointer border-b border-slate-800/60 pb-1 hover:text-blue-300 text-sm"
+                onClick={() => toggleGroup(groupName)}
+              >
+                <span className="text-slate-400 mono w-4">{isCollapsed ? '▶' : '▼'}</span>
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  ref={el => { if (el) el.indeterminate = indeterminate; }}
+                  onChange={toggleGroupSelection}
+                  onClick={(e) => e.stopPropagation()}
+                  title="그룹 전체 선택/해제"
+                />
+                <span className="font-medium">{groupName}</span>
+                <span className="text-xs text-slate-500">
+                  ({groupSelectedCount > 0 ? `${groupSelectedCount}/` : ''}{chars.length}명)
+                </span>
+              </div>
+              {!isCollapsed && (
+                <div className="space-y-1">
+                  {chars.map(c => (
+                    <label key={c.id} className={`flex items-center gap-2 p-2 rounded-lg cursor-pointer ${selectedSet.has(c.id)?'bg-blue-900/30':'hover:bg-slate-800/40'}`}>
+                      <input type="checkbox" checked={selectedSet.has(c.id)} onChange={()=>toggleChar(c.id)} />
+                      <span className="flex-1 truncate">{c.name}</span>
+                      {(c.referenceImages?.filter(r=>r.enabled!==false).length || 0) > 0 && <span className="badge badge-running">PR {c.referenceImages.filter(r=>r.enabled!==false).length}</span>}
+                      <span className="text-xs text-slate-500 mono truncate max-w-[40%]">{c.basePrompt?.slice(0,60)}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {characters.length === 0 && <div className="text-slate-500 text-sm p-2">캐릭터를 먼저 추가하세요.</div>}
+      </div>
+    </div>
+  );
+}
+
 function BatchPromptCard({ batch, setBatch, preset }) {
   const upd = (patch) => setBatch(b => ({ ...b, ...patch }));
   const [showPreview, setShowPreview] = useState(false);
+  const [bpresets, setBpresets] = useState([]);
+  const [bpresetId, setBpresetId] = useState(() => localStorage.getItem('nai-batch-preset-id') || '');
   const qualityText = QUALITY_PRESETS[preset?.model] || QUALITY_PRESETS['nai-diffusion-4-5-full'];
+
+  const reloadBpresets = async () => {
+    const ps = await db.getAll('batchPresets');
+    setBpresets(ps.sort((a,b) => (a.name||'').localeCompare(b.name||'')));
+  };
+  useEffect(() => { reloadBpresets(); }, []);
+  useEffect(() => { localStorage.setItem('nai-batch-preset-id', bpresetId || ''); }, [bpresetId]);
+
+  const applyBpreset = (id) => {
+    setBpresetId(id);
+    if (!id) return;
+    const p = bpresets.find(x => x.id === id);
+    if (!p) return;
+    setBatch(b => ({
+      ...b,
+      prompt: p.prompt || '',
+      negativePrompt: p.negativePrompt || '',
+      qualityTagsEnabled: !!p.qualityTagsEnabled,
+      ucLevel: p.ucLevel || 'none',
+    }));
+  };
+  const saveAsNewBpreset = async () => {
+    const name = (window.prompt('새 배치 프리셋 이름?') || '').trim();
+    if (!name) return;
+    const id = uid('bpset');
+    const now = nowIso();
+    await db.put('batchPresets', {
+      id, name,
+      prompt: batch.prompt || '',
+      negativePrompt: batch.negativePrompt || '',
+      qualityTagsEnabled: !!batch.qualityTagsEnabled,
+      ucLevel: batch.ucLevel || 'none',
+      createdAt: now, updatedAt: now,
+    });
+    await reloadBpresets();
+    setBpresetId(id);
+  };
+  const overwriteBpreset = async () => {
+    if (!bpresetId) return;
+    const cur = bpresets.find(x => x.id === bpresetId);
+    if (!cur) return;
+    await db.put('batchPresets', {
+      ...cur,
+      prompt: batch.prompt || '',
+      negativePrompt: batch.negativePrompt || '',
+      qualityTagsEnabled: !!batch.qualityTagsEnabled,
+      ucLevel: batch.ucLevel || 'none',
+      updatedAt: nowIso(),
+    });
+    await reloadBpresets();
+  };
+  const renameBpreset = async () => {
+    if (!bpresetId) return;
+    const cur = bpresets.find(x => x.id === bpresetId);
+    if (!cur) return;
+    const name = (window.prompt('새 이름?', cur.name) || '').trim();
+    if (!name || name === cur.name) return;
+    await db.put('batchPresets', { ...cur, name, updatedAt: nowIso() });
+    await reloadBpresets();
+  };
+  const deleteBpreset = async () => {
+    if (!bpresetId) return;
+    await db.delete('batchPresets', bpresetId);
+    setBpresetId('');
+    await reloadBpresets();
+  };
   const ucText = UC_PRESETS[batch.ucLevel] || '';
   const previewPrompt = [
     batch.qualityTagsEnabled ? qualityText : '',
@@ -1167,6 +1767,23 @@ function BatchPromptCard({ batch, setBatch, preset }) {
       <div className="flex items-center justify-between flex-wrap gap-2">
         <div className="font-semibold">배치 공통 Prompt / Undesired Content</div>
         <div className="text-xs text-slate-400">모든 작업에 공통으로 적용됩니다 (캐릭터 basePrompt · 슬롯 프롬프트보다 앞에 위치).</div>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap text-xs border-b border-slate-800/60 pb-3">
+        <span className="text-slate-400">프리셋</span>
+        <select className="input py-1 text-xs" style={{ width:'auto', minWidth:'180px' }}
+          value={bpresetId} onChange={e=>applyBpreset(e.target.value)}>
+          <option value="">(선택 안 함)</option>
+          {bpresets.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        <button className="btn" onClick={saveAsNewBpreset}>+ 새 프리셋으로 저장</button>
+        {bpresetId && (
+          <>
+            <button className="btn" onClick={overwriteBpreset} title="현재 입력값으로 선택한 프리셋 덮어쓰기">덮어쓰기</button>
+            <button className="btn btn-ghost" onClick={renameBpreset}>이름변경</button>
+            <ConfirmButton className="btn btn-ghost text-red-400" confirmText="삭제 확인" onConfirm={deleteBpreset}>삭제</ConfirmButton>
+          </>
+        )}
       </div>
 
       <div className="space-y-2">
@@ -1307,12 +1924,15 @@ function BatchRunPage({ characters, promptSets, settings }) {
     const jobs = await db.jobsBySession(runner.get().sessionId);
     const failed = jobs.filter(j => j.status === 'failed');
     if (!failed.length) return;
+    const idSet = new Set(failed.map(j => j.id));
     for (const j of failed) {
       await db.put('jobs', { ...j, status: 'pending', retryCount: 0, errorMessage: undefined, completedAt: undefined });
     }
     const session = await db.get('sessions', runner.get().sessionId);
-    const fresh = (await db.jobsBySession(session.id)).sort((a,b)=>a.order-b.order);
-    startRun({ session, jobs: fresh, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
+    const targets = (await db.jobsBySession(session.id))
+      .filter(j => idSet.has(j.id))
+      .sort((a,b)=>a.order-b.order);
+    startRun({ session, jobs: targets, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
   };
 
   const retrySelected = async (jobIds) => {
@@ -1321,23 +1941,27 @@ function BatchRunPage({ characters, promptSets, settings }) {
     if (!sessionId || !jobIds?.length) return;
     const idSet = new Set(jobIds);
     const all = await db.jobsBySession(sessionId);
-    for (const j of all) {
-      if (idSet.has(j.id)) {
-        await db.put('jobs', {
-          ...j,
-          status: 'pending',
-          retryCount: 0,
-          errorMessage: undefined,
-          completedAt: undefined,
-          startedAt: undefined,
-          seed: randSeed(),
-        });
-      }
+    const targets = all.filter(j => idSet.has(j.id)).sort((a,b)=>a.order-b.order);
+    if (!targets.length) return;
+    for (const j of targets) {
+      await db.put('jobs', {
+        ...j,
+        status: 'pending',
+        retryCount: 0,
+        errorMessage: undefined,
+        completedAt: undefined,
+        startedAt: undefined,
+        seed: randSeed(),
+      });
     }
-    rlog('info', `${jobIds.length}개 잡 재생성 예약 (새 seed)`);
+    rlog('info', `재생성 대상 ${targets.length}개: ${targets.map(j=>'#'+pad(j.order)).join(', ')}`);
     const session = sessionObj || await db.get('sessions', sessionId);
-    const fresh = (await db.jobsBySession(sessionId)).sort((a,b)=>a.order-b.order);
-    startRun({ session, jobs: fresh, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
+    // Only the selected targets — others stay untouched
+    const freshTargets = (await db.jobsBySession(sessionId))
+      .filter(j => idSet.has(j.id))
+      .sort((a,b)=>a.order-b.order);
+    console.log('[retrySelected] startRun jobs:', freshTargets.length, freshTargets.map(j=>({order:j.order, id:j.id, status:j.status})));
+    startRun({ session, jobs: freshTargets, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
   };
 
   const progress = useMemo(() => {
@@ -1353,24 +1977,11 @@ function BatchRunPage({ characters, promptSets, settings }) {
       {error && <div className="card p-3 border-red-500/40 text-red-300 text-sm">{error}</div>}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="card p-4 space-y-3">
-          <div className="font-semibold">캐릭터 선택 <span className="text-xs text-slate-400">({selectedChars.length}/{characters.length})</span></div>
-          <div className="flex gap-2 text-xs">
-            <button className="btn btn-ghost" onClick={()=>setSelectedChars(characters.map(c=>c.id))}>전체</button>
-            <button className="btn btn-ghost" onClick={()=>setSelectedChars([])}>해제</button>
-          </div>
-          <div className="max-h-72 overflow-auto space-y-1">
-            {characters.map(c => (
-              <label key={c.id} className={`flex items-center gap-2 p-2 rounded-lg cursor-pointer ${selectedChars.includes(c.id)?'bg-blue-900/30':'hover:bg-slate-800/40'}`}>
-                <input type="checkbox" checked={selectedChars.includes(c.id)} onChange={()=>toggleChar(c.id)} />
-                <span className="flex-1 truncate">{c.name}</span>
-                {(c.referenceImages?.filter(r=>r.enabled!==false).length || 0) > 0 && <span className="badge badge-running">PR {c.referenceImages.filter(r=>r.enabled!==false).length}</span>}
-                <span className="text-xs text-slate-500 mono truncate max-w-[40%]">{c.basePrompt?.slice(0,60)}</span>
-              </label>
-            ))}
-            {characters.length === 0 && <div className="text-slate-500 text-sm p-2">캐릭터를 먼저 추가하세요.</div>}
-          </div>
-        </div>
+        <CharacterPicker
+          characters={characters}
+          selectedChars={selectedChars}
+          setSelectedChars={setSelectedChars}
+        />
         <div className="card p-4 space-y-3">
           <div className="font-semibold">프롬프트 세트</div>
           <select className="input" value={promptSetId} onChange={e=>setPromptSetId(e.target.value)}>
@@ -1440,7 +2051,36 @@ async function downloadJobImage(job) {
   downloadBlob(`${safe}.png`, blob);
 }
 
-function JobImage({ jobId, size = 64 }) {
+async function _exportJobsZip(jobs, label) {
+  const successful = jobs.filter(j => j.status === 'success');
+  if (!successful.length) return 0;
+  const charCount = new Set(successful.map(j => j.characterName)).size;
+  const zip = new JSZip();
+  for (const j of successful) {
+    const blob = await getImageBlob(j.id);
+    if (!blob) continue;
+    const safeTitle = sanitizeFs(j.promptTitle) || `job_${j.order}`;
+    const path = charCount > 1
+      ? `${sanitizeFs(j.characterName) || 'unnamed'}/${safeTitle}.png`
+      : `${safeTitle}.png`;
+    zip.file(path, blob);
+  }
+  const content = await zip.generateAsync({ type: 'blob' });
+  const stamp = new Date().toISOString().replace(/[:T]/g, '-').replace(/\..+$/, '');
+  downloadBlob(`nai_batch_${label}_${stamp}.zip`, content);
+  return successful.length;
+}
+
+async function exportAllJobs(jobs) {
+  return _exportJobsZip(jobs, 'all');
+}
+
+async function exportSelectedJobs(jobs, selectedIds) {
+  const idSet = new Set(selectedIds);
+  return _exportJobsZip(jobs.filter(j => idSet.has(j.id)), 'selected');
+}
+
+function JobImage({ jobId, size = 96, onOpen }) {
   const [url, setUrl] = useState(null);
   useEffect(() => {
     let active = true;
@@ -1455,14 +2095,78 @@ function JobImage({ jobId, size = 64 }) {
   }, [jobId]);
   if (!url) return <div className="text-slate-600 text-xs">—</div>;
   return (
-    <a href={url} target="_blank" rel="noreferrer" title="새 탭에서 원본 열기">
-      <img src={url} alt="" style={{width: size, height: size, objectFit: 'cover'}} className="rounded border border-slate-700" />
-    </a>
+    <button type="button" onClick={() => onOpen && onOpen(jobId)} title="클릭하면 크게 보기" className="p-0 border-0 bg-transparent cursor-pointer">
+      <img src={url} alt="" style={{width: size, height: size, objectFit: 'cover'}} className="rounded border border-slate-700 hover:border-blue-400 transition-colors" />
+    </button>
+  );
+}
+
+function Lightbox({ job, jobs, selected, onToggleSelect, onClose, onNav, allowRetry }) {
+  const [url, setUrl] = useState(null);
+
+  useEffect(() => {
+    if (!job) { setUrl(null); return; }
+    let active = true;
+    let created = null;
+    (async () => {
+      const blob = await getImageBlob(job.id);
+      if (!active || !blob) return;
+      created = URL.createObjectURL(blob);
+      setUrl(created);
+    })();
+    return () => { active = false; if (created) URL.revokeObjectURL(created); };
+  }, [job?.id]);
+
+  useEffect(() => {
+    if (!job) return;
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); onClose(); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); onNav(-1); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); onNav(1); }
+      else if (allowRetry && onToggleSelect && (e.key === ' ' || e.code === 'Space')) { e.preventDefault(); onToggleSelect(job.id); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [job?.id, onClose, onNav, onToggleSelect, allowRetry]);
+
+  if (!job) return null;
+  const idx = jobs.findIndex(j => j.id === job.id);
+  const isSelected = selected?.has(job.id);
+
+  return (
+    <div className="fixed inset-0 bg-black/85 z-50 flex items-center justify-center" onClick={onClose}>
+      <button className="absolute top-4 right-4 btn z-10" onClick={(e)=>{e.stopPropagation(); onClose();}}>✕ 닫기 (ESC)</button>
+      <button className="absolute left-4 top-1/2 -translate-y-1/2 btn z-10" onClick={(e)=>{e.stopPropagation(); onNav(-1);}} disabled={jobs.length<=1}>◀</button>
+      <button className="absolute right-4 top-1/2 -translate-y-1/2 btn z-10" onClick={(e)=>{e.stopPropagation(); onNav(1);}} disabled={jobs.length<=1}>▶</button>
+      <div className="flex flex-col items-center gap-3 max-w-[90vw]" onClick={(e)=>e.stopPropagation()}>
+        {url ? <img src={url} className="max-w-full max-h-[78vh] object-contain rounded" alt="" /> : <div className="text-slate-400">로딩 중…</div>}
+        <div className="bg-slate-900/90 rounded px-4 py-3 text-xs text-slate-200 w-full max-w-2xl">
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="font-semibold">{job.characterName}</span>
+            <span className="text-slate-300">{job.promptTitle}</span>
+            <span className="mono text-slate-400">#{pad(job.order)}</span>
+            <span className="mono text-slate-400">seed {job.seed}</span>
+            <button className="btn btn-ghost ml-auto" onClick={()=>downloadJobImage(job)}>저장</button>
+            {allowRetry && onToggleSelect && (
+              <label className="flex items-center gap-2 cursor-pointer select-none px-2 py-1 rounded bg-slate-800/60">
+                <input type="checkbox" checked={!!isSelected} onChange={()=>onToggleSelect(job.id)} />
+                재생성 후보
+              </label>
+            )}
+          </div>
+          <div className="text-slate-500 text-xxs mt-2">
+            {idx+1} / {jobs.length} · ← → 이동 · ESC 닫기{allowRetry ? ' · Space 선택 토글' : ''}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
 function QueueTable({ jobs, allowRetry, onRetrySelected }) {
   const [selected, setSelected] = useState(() => new Set());
+  const [exporting, setExporting] = useState(false);
+  const [lightboxId, setLightboxId] = useState(null);
   const r = useStore(runner);
   if (!jobs.length) return <div className="text-slate-500 text-sm">큐가 비었습니다. “큐 생성”을 누르세요.</div>;
 
@@ -1471,6 +2175,15 @@ function QueueTable({ jobs, allowRetry, onRetrySelected }) {
     if (ns.has(id)) ns.delete(id); else ns.add(id);
     return ns;
   });
+  const successJobs = jobs.filter(j => j.status === 'success');
+  const activeJob = lightboxId ? successJobs.find(j => j.id === lightboxId) : null;
+  const navLightbox = (dir) => {
+    if (!successJobs.length) return;
+    const i = successJobs.findIndex(j => j.id === lightboxId);
+    if (i === -1) { setLightboxId(successJobs[0].id); return; }
+    const next = (i + dir + successJobs.length) % successJobs.length;
+    setLightboxId(successJobs[next].id);
+  };
   const allSelected = jobs.length > 0 && selected.size === jobs.length;
   const toggleAll = () => setSelected(allSelected ? new Set() : new Set(jobs.map(j => j.id)));
   const canRetry = allowRetry && !r.isRunning && selected.size > 0;
@@ -1480,16 +2193,40 @@ function QueueTable({ jobs, allowRetry, onRetrySelected }) {
     setSelected(new Set());
     onRetrySelected(ids);
   };
+  const successCount = jobs.filter(j => j.status === 'success').length;
+  const selectedSuccessCount = jobs.filter(j => j.status === 'success' && selected.has(j.id)).length;
+  const handleExport = async () => {
+    if (!successCount || exporting) return;
+    setExporting(true);
+    try { await exportAllJobs(jobs); }
+    catch (e) { rlog('error', `일괄 저장 실패: ${e.message||e}`); }
+    finally { setExporting(false); }
+  };
+  const handleExportSelected = async () => {
+    if (!selectedSuccessCount || exporting) return;
+    setExporting(true);
+    try { await exportSelectedJobs(jobs, Array.from(selected)); }
+    catch (e) { rlog('error', `선택 저장 실패: ${e.message||e}`); }
+    finally { setExporting(false); }
+  };
 
   return (
     <div className="space-y-2">
-      {allowRetry && (
-        <div className="flex items-center gap-2 text-xs">
-          <span className="text-slate-400">선택: <span className="mono text-slate-200">{selected.size}</span></span>
-          {selected.size > 0 && <button className="btn btn-ghost" onClick={()=>setSelected(new Set())}>해제</button>}
-          <button className="btn btn-primary ml-auto" disabled={!canRetry} onClick={doRetry}>선택한 항목 재생성</button>
-        </div>
-      )}
+      <div className="flex items-center gap-2 text-xs flex-wrap">
+        {allowRetry && (
+          <>
+            <span className="text-slate-400">선택: <span className="mono text-slate-200">{selected.size}</span></span>
+            {selected.size > 0 && <button className="btn btn-ghost" onClick={()=>setSelected(new Set())}>해제</button>}
+            <button className="btn btn-primary" disabled={!canRetry} onClick={doRetry}>선택한 항목 재생성</button>
+            <button className="btn" disabled={!selectedSuccessCount || exporting} onClick={handleExportSelected}>
+              {exporting ? '내보내는 중…' : `선택 저장 (${selectedSuccessCount}장)`}
+            </button>
+          </>
+        )}
+        <button className="btn ml-auto" disabled={!successCount || exporting} onClick={handleExport}>
+          {exporting ? '내보내는 중…' : `전체 저장 (${successCount}장)`}
+        </button>
+      </div>
       <div className="overflow-auto max-h-[600px]">
         <table className="w-full text-sm">
           <thead className="text-xs text-slate-400 sticky top-0 bg-[#131826]">
@@ -1511,7 +2248,7 @@ function QueueTable({ jobs, allowRetry, onRetrySelected }) {
               <tr key={j.id} className={`row-hover border-t border-slate-800/60 ${selected.has(j.id) ? 'bg-blue-900/20' : ''}`}>
                 {allowRetry && <td className="p-2 align-middle"><input type="checkbox" checked={selected.has(j.id)} onChange={()=>toggle(j.id)} /></td>}
                 <td className="p-2 mono align-middle">{pad(j.order)}</td>
-                <td className="p-2 align-middle">{j.status === 'success' ? <JobImage jobId={j.id} /> : <div className="w-16 h-16 rounded border border-dashed border-slate-700" />}</td>
+                <td className="p-2 align-middle">{j.status === 'success' ? <JobImage jobId={j.id} onOpen={setLightboxId} /> : <div className="w-24 h-24 rounded border border-dashed border-slate-700" />}</td>
                 <td className="p-2 align-middle">{j.characterName}</td>
                 <td className="p-2 truncate max-w-[200px] align-middle">{j.promptTitle}</td>
                 <td className="p-2 align-middle"><Badge status={j.status} /></td>
@@ -1524,6 +2261,15 @@ function QueueTable({ jobs, allowRetry, onRetrySelected }) {
           </tbody>
         </table>
       </div>
+      <Lightbox
+        job={activeJob}
+        jobs={successJobs}
+        selected={selected}
+        onToggleSelect={allowRetry ? toggle : undefined}
+        onClose={() => setLightboxId(null)}
+        onNav={navLightbox}
+        allowRetry={allowRetry}
+      />
     </div>
   );
 }
@@ -1583,24 +2329,27 @@ function SessionsPage({ characters, promptSets, settings }) {
     if (!openId || !jobIds?.length || r.isRunning) return;
     const idSet = new Set(jobIds);
     const all = await db.jobsBySession(openId);
-    for (const j of all) {
-      if (idSet.has(j.id)) {
-        await db.put('jobs', {
-          ...j,
-          status: 'pending',
-          retryCount: 0,
-          errorMessage: undefined,
-          completedAt: undefined,
-          startedAt: undefined,
-          seed: randSeed(),
-        });
-      }
+    const targets = all.filter(j => idSet.has(j.id)).sort((a,b)=>a.order-b.order);
+    if (!targets.length) return;
+    for (const j of targets) {
+      await db.put('jobs', {
+        ...j,
+        status: 'pending',
+        retryCount: 0,
+        errorMessage: undefined,
+        completedAt: undefined,
+        startedAt: undefined,
+        seed: randSeed(),
+      });
     }
-    rlog('info', `${jobIds.length}개 잡 재생성 예약 (새 seed)`);
+    rlog('info', `재생성 대상 ${targets.length}개: ${targets.map(j=>'#'+pad(j.order)).join(', ')}`);
     const session = await db.get('sessions', openId);
-    const fresh = (await db.jobsBySession(openId)).sort((a,b)=>a.order-b.order);
-    setJobs(fresh);
-    startRun({ session, jobs: fresh, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
+    // Only the selected targets — others stay untouched
+    const freshTargets = (await db.jobsBySession(openId))
+      .filter(j => idSet.has(j.id))
+      .sort((a,b)=>a.order-b.order);
+    setJobs(await db.jobsBySession(openId).then(js => js.sort((a,b)=>a.order-b.order)));
+    startRun({ session, jobs: freshTargets, preset: session.preset, settings }).catch(e => { rlog('error', String(e.message||e)); });
   };
 
   return (
